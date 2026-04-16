@@ -55,10 +55,12 @@ CLEAR <- function(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 2) {
     Z_poly$Y_comb <- Y_comb
   
     # print(h)
-    glm_fut <- suppressWarnings(glm(Y_comb ~ . -1, data = Z_poly, family = binomial))
+    glm_fit <- suppressWarnings(glm(Y_comb ~ . -1, data = Z_poly, family = binomial))
+    # check glm_fit convergence
+    if (!glm_fit$converged) {warning(sprintf("GLM did not converge for Site %d", h))}
   
     Z0_poly <- Z_poly[(n_h + 1):nrow(Z_poly), ]
-    prob <- predict(glm_fut, newdata = Z0_poly, type = "response")
+    prob <- predict(glm_fit, newdata = Z0_poly, type = "response")
     prob <- pmin(pmax(prob, 1e-6), 1 - 1e-6)
 
     omega <- (n_0 / n_h) * (prob / (1 - prob)) 
