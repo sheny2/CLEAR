@@ -1,0 +1,245 @@
+---
+title: "Federated Exploration"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set()
+# rm(list = ls())
+library(MASS)
+library(sn) 
+library(tidyverse)
+library(glmnet)
+
+set.seed(202604)
+source("CLEAR.R")
+source("CLEAR-KDE.R")
+```
+
+
+ ***CLEAR: Collaborative Local Estimation via Artificial Reference-data***
+
+
+## 1. Setup and Data Generation
+
+First, source our custom CLEAR functions and generate a federated dataset across 10 sites featuring covariate shift and varied skewness.
+
+```{r data_generation}
+# DGP (Covariate Shift with Skewness)
+M <- 10                     
+d <- 4               
+vars <- c(paste0("X", 1:(d-1)), "Y")
+n_k <- sample(200:800, M, replace = TRUE)
+
+shuffled_sites <- sample(1:M)
+size1 = size2 = round(M/3)
+size3 <- M - (size1 + size2) 
+profiles <- list(
+  group1 = list(mu = c(50, 55, 60, 65), rho = 0.6, skew = 5, sites = shuffled_sites[1:size1]),
+  group2 = list(mu = c(40, 42, 45, 48), rho = 0.4, skew = 2, sites = shuffled_sites[(size1 + 1):(size1 + size2)]),
+  group3 = list(mu = c(25, 28, 30, 32), rho = 0.2, skew = 0, sites = shuffled_sites[(size1 + size2 + 1):M])
+)
+
+site_data_list <- list()
+variable_sd <- runif(d, min = 5, max = 20)
+ 
+for (k in 1:M) {
+  current_prof <- Filter(function(p) k %in% p$sites, profiles)[[1]]
+  R <- matrix(current_prof$rho, nrow = d, ncol = d)
+  diag(R) <- 1
+  
+  D <- diag(variable_sd[1:d])
+  Sigma <- D %*% R %*% D
+  
+  df <- as.data.frame(rmsn( # multivariate skew-normal distribution
+    n     = n_k[k], 
+    # xi    = rep(current_prof$mu, length.out = d), 
+    xi = current_prof$mu,
+    Omega = Sigma, 
+    alpha = rep(current_prof$skew, length.out = d)
+  ))
+  
+colnames(df) <- vars
+site_data_list[[k]] <- df
+}
+
+sample_size <- sapply(site_data_list, nrow); 
+cat("\nSample Sizes \n"); sample_size 
+total_sample_size <- sum(sapply(site_data_list, nrow))
+cat("\nTotal Sample Size \n");total_sample_size
+```
+
+## 2. Execute CLEAR Pipeline
+
+We run the CLEAR protocol to estimate local density ratios and generate the augmented artificial dataset.
+
+```{r run_CLEAR}
+# RUN CLEAR
+CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1.5)
+# CLEAR_results <- CLEAR_KDE(site_data_list, K_comp = 3, n_0 = 1000, inf_cfactor = 1.5)
+cat("\n Reference Dataset Dim \n");CLEAR_results$Z_0 %>% dim()
+CLEAR_results <- CLEAR_results
+```
+
+## 3. EDA Statistics Evaluation (Site 1)
+
+Comparing the IPW estimates from the CLEAR pipeline directly against the empirical truth for Site 1.
+
+```{r eval_stats}
+target_site <- 1
+truth_site1 <- calc_empirical_truth(site_data_list[[target_site]])
+est_site1 <- CLEAR_results[[paste0("Site_", target_site)]]
+
+cat(sprintf("=== EVALUATION: CLEAR vs TRUTH (Site %d) ===\n", target_site));
+# Metrics (Mean, Variance, Skewness, Kurtosis)
+for (stat in c("Mean", "Variance", "Skewness", "Kurtosis")) {
+  cat(sprintf("\n>>> %s <<<\n", stat))
+  comp_df <- data.frame(
+    Variable = vars,
+    Truth = round(truth_site1[[stat]], 4),
+    CLEAR = round(est_site1[[stat]], 4),
+    Abs_Error = round(abs(est_site1[[stat]] - truth_site1[[stat]]), 4)
+  )
+  print(comp_df, row.names = FALSE)
+}
+
+# Covariance Matrix
+cat("\n[True Covariance]\n");print(round(truth_site1$Covariance, 2))
+
+cat("\n[CLEAR Estimated Covariance]\n"); print(round(est_site1$Covariance, 2))
+```
+
+## 4. Visualizing Distribution Recovery
+
+### 4.1 Local Site Recovery (Site 1)
+
+Overlaying the CLEAR estimated distribution with the true local data.
+
+```{r plot_local}
+Z_0 <- CLEAR_results$Z_0
+ipw_weights <- CLEAR_results[[paste0("Site_", target_site)]]$Weights
+true_data <- site_data_list[[target_site]]
+
+df_true <- true_data %>%
+  mutate(Source = "True Local Data", 
+         Weight = 1 / nrow(true_data)) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value")
+
+df_CLEAR <- Z_0 %>%
+  mutate(Source = "CLEAR Data", 
+         Weight = ipw_weights) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value")
+
+plot_df <- bind_rows(df_true, df_CLEAR)
+
+ggplot(plot_df, aes(x = Value, weight = Weight, fill = Source, color = Source)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  theme_minimal(base_size = 14) +
+  scale_fill_manual(values = c("True Local Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  scale_color_manual(values = c("True Local Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  labs(title = sprintf("Distribution Recovery: CLEAR vs True Data (Site %d)", target_site),
+       x = "Variable Value", y = "Density") +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+### 4.2 Global Distribution Recovery
+
+Evaluating the overall global population by averaging weights across all sites.
+
+```{r plot_global}
+# Calculate Global CLEAR Weights
+w_global <- rep(0, nrow(Z_0))
+for (h in 1:M) {
+  w_global <- w_global + CLEAR_results[[paste0("Site_", h)]]$Weights
+}
+w_global <- w_global / M
+
+# Prepare Global Truth Data
+true_data_global <- bind_rows(site_data_list) 
+df_true_global <- true_data_global %>%
+  mutate(Source = "True Global Data", 
+         Weight = 1 / nrow(true_data_global)) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value")
+
+# Prepare Global CLEAR Data
+df_CLEAR_global <- Z_0 %>%
+  mutate(Source = "CLEAR Data", 
+         Weight = w_global) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value")
+
+plot_df_global <- bind_rows(df_true_global, df_CLEAR_global)
+
+ggplot(plot_df_global, aes(x = Value, weight = Weight, fill = Source, color = Source)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  theme_minimal(base_size = 14) +
+  scale_fill_manual(values = c("True Global Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  scale_color_manual(values = c("True Global Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  labs(title = "Global Distribution Recovery: CLEAR vs Pooled True Data",
+       x = "Variable Value", y = "Density") +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+
+## 5. Variable Selection & Downstream Modeling
+
+Using the IPW weights to perform variable selection natively on the artificial data, comparing the discovered coefficients with those fitted on the true, private data.
+
+
+```{r}
+x_vars <- vars[vars != "Y"] 
+X_CLEAR <- as.matrix(Z_0[, x_vars])
+Y_CLEAR <- Z_0$Y
+w_site1 <- CLEAR_results[[paste0("Site_", target_site)]]$Weights
+
+# True matrices
+X_true_site1 <- as.matrix(site_data_list[[target_site]][, x_vars])
+Y_true_site1 <- site_data_list[[target_site]]$Y
+
+X_true_global <- as.matrix(true_data_global[, x_vars])
+Y_true_global <- true_data_global$Y
+
+# --- Run Lasso Models ---
+# Site 1 Level
+cv_true_site1 <- cv.glmnet(X_true_site1, Y_true_site1, alpha = 1)
+coef_true_site1 <- as.vector(coef(cv_true_site1, s = "lambda.min"))
+
+cv_CLEAR_site1 <- cv.glmnet(X_CLEAR, Y_CLEAR, alpha = 1, weights = w_site1)
+coef_CLEAR_site1 <- as.vector(coef(cv_CLEAR_site1, s = "lambda.min"))
+
+# Global Level
+cv_true_global <- cv.glmnet(X_true_global, Y_true_global, alpha = 1)
+coef_true_global <- as.vector(coef(cv_true_global, s = "lambda.min"))
+
+cv_CLEAR_global <- cv.glmnet(X_CLEAR, Y_CLEAR, alpha = 1, weights = w_global)
+coef_CLEAR_global <- as.vector(coef(cv_CLEAR_global, s = "lambda.min"))
+
+feature_labels <- c("Intercept", x_vars)
+
+comp_site1 <- data.frame(
+  Feature = feature_labels,
+  Truth = round(coef_true_site1, 4),
+  CLEAR = round(coef_CLEAR_site1, 4),
+  Abs_Error = round(abs(coef_CLEAR_site1 - coef_true_site1), 4)
+)
+cat("\n>>> SITE", target_site, ": Lasso Coefficients <<<\n")
+print(comp_site1, row.names = FALSE)
+
+comp_global <- data.frame(
+  Feature = feature_labels,
+  Truth = round(coef_true_global, 4),
+  CLEAR = round(coef_CLEAR_global, 4),
+  Abs_Error = round(abs(coef_CLEAR_global - coef_true_global), 4)
+)
+cat("\n>>> GLOBAL POOLED: Lasso Coefficients <<<\n")
+print(comp_global, row.names = FALSE)
+```
