@@ -17,7 +17,7 @@ library(sn)
 library(tidyverse)
 library(glmnet)
 
-set.seed(20260418)
+set.seed(202604)
 source("CLEAR.R")
 source("CLEAR-KDE.R")
 source("CLEAR-KNN.R")
@@ -88,9 +88,9 @@ We run the CLEAR protocol to estimate local density ratios and generate the augm
 
 ```{r run_CLEAR}
 # RUN CLEAR
-CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
+CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1.5)
 # CLEAR_results <- CLEAR_KDE(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
-CLEAR_results <- CLEAR_KNN(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 1)
+# CLEAR_results <- CLEAR_KNN(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 1)
 cat("\n Reference Dataset Dim \n");CLEAR_results$Z_0 %>% dim()
 CLEAR_results <- CLEAR_results
 ```
@@ -198,6 +198,8 @@ ggplot(plot_df_global, aes(x = Value, weight = Weight, fill = Source, color = So
 ```
 
 
+
+
 ## 5. Variable Selection & Downstream Modeling
 
 Using the IPW weights to perform variable selection natively on the artificial data, comparing the discovered coefficients with those fitted on the true, private data.
@@ -251,3 +253,119 @@ comp_global <- data.frame(
 cat("\n>>> GLOBAL POOLED: Lasso Coefficients <<<\n")
 print(comp_global, row.names = FALSE)
 ```
+
+
+
+# If no weight adjustment
+$Z_0$ the reference data also seems well-matched with the true global data. But the value of the method is that it can recover local site distributions without sharing any IPD, and the global distribution is a byproduct of the local recoveries. The IPW weights allow us to flexibly adjust the reference data to match each site's distribution, which is crucial for accurate local recovery. 
+
+```{r}
+# Prepare Global CLEAR Data
+df_CLEAR_global <- Z_0 %>%
+  mutate(Source = "CLEAR Data", 
+         Weight = 1) %>%
+  pivot_longer(cols = all_of(vars), names_to = "Variable", values_to = "Value")
+
+plot_df_global <- bind_rows(df_true_global, df_CLEAR_global)
+
+ggplot(plot_df_global, aes(x = Value, weight = Weight, fill = Source, color = Source)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  theme_minimal(base_size = 14) +
+  scale_fill_manual(values = c("True Global Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  scale_color_manual(values = c("True Global Data" = "#2c7bb6", "CLEAR Data" = "#d7191c")) +
+  labs(title = "Global Distribution Recovery: CLEAR vs Pooled True Data",
+       x = "Variable Value", y = "Density") +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        strip.text = element_text(face = "bold", size = 12))
+
+plot(density(Z_0$X3), main = "Global Density: CLEAR", ylab = "Density") # no weights
+```
+
+
+```{r, fig.width=10, fig.height=6}
+library(ggridges)
+library(patchwork)
+
+# 1. Prepare Long-Format Weight Data
+weight_data <- data.frame(
+  Weight = unlist(lapply(1:M, function(h) CLEAR_results[[paste0("Site_", h)]]$Weights)),
+  Site = factor(rep(1:M, each = nrow(Z_0)))
+)
+
+# 2. Site-specific vs Global Weight Distribution (Ridge Plot)
+p1 <- ggplot(weight_data, aes(x = Weight, y = Site, fill = Site)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.5, rel_min_height = 0.01) +
+  geom_vline(xintercept = 1/nrow(Z_0), linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Weight Distribution by Site",
+       subtitle = "Red dashed line indicates uniform weight (1/n_0)",
+       x = "Normalized IPW Weight", y = "Site ID") +
+  theme(legend.position = "none")
+
+# 3. Global Weight Summary
+global_weights <- data.frame(Weight = w_global)
+p2 <- ggplot(global_weights, aes(x = Weight)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Global Aggregated Weight Distribution",
+       x = "Average Weight across Sites", y = "Frequency")
+
+# 4. Weight Concentration Plot (How weights relate to a key feature, e.g., X1)
+p3 <- ggplot(Z_0, aes(x = X1, y = X3, color = w_global)) +
+  geom_point(alpha = 0.5, size = 0.8) +
+  scale_color_viridis_c(option = "magma", name = "Global Weight") +
+  theme_minimal() +
+  labs(title = "Weight Concentration")
+
+(p1 | p2) / p3
+```
+
+
+Remember three types of sites
+```{r}
+profiles$group1$sites
+profiles$group2$sites
+profiles$group3$sites
+```
+
+
+```{r, fig.width=12, fig.height=8}
+M <- length(CLEAR_results) - 1 
+
+plot_data_faceted <- lapply(1:M, function(h) {
+  site_key <- paste0("Site_", h)
+  Z_0 %>%
+    select(X1, X3) %>%
+    mutate(
+      Weight = CLEAR_results[[site_key]]$Weights,
+      Site = paste("Site", h)
+    )
+}) %>% bind_rows()
+
+ggplot(plot_data_faceted, aes(x = X1, y = X3, color = Weight)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  scale_color_viridis_c(
+    option = "magma", 
+    name = "IPW Weight",
+    trans = "sqrt" # Optional: using sqrt scale helps highlight lower weights if distribution is skewed
+  ) +
+  facet_wrap(~Site, ncol = 4) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Weight Concentration Across Sites",
+    subtitle = "Visualizing how the Reference Distribution (Z_0) is weighted to recover each local site's density") +
+  theme(legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank())
+```
+
+If we want to say how the weights are distributed for reference data for different sites, we can also plot the weights directly:
+Site 1 and 2 are similar bc they are in the same group profile, site 5 is different. 
+```{r}
+plot(1:50, CLEAR_results$Site_1$Weights[1:50], type = "l", main = "IPW Weights for Site 1", xlab = "Index", ylab = "Weight")
+plot(1:50, CLEAR_results$Site_2$Weights[1:50], type = "l", main = "IPW Weights for Site 2", xlab = "Index", ylab = "Weight")
+plot(1:50, CLEAR_results$Site_5$Weights[1:50], type = "l", main = "IPW Weights for Site 5", xlab = "Index", ylab = "Weight")
+```
+
+
