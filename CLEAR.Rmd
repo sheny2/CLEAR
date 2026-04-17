@@ -17,9 +17,10 @@ library(sn)
 library(tidyverse)
 library(glmnet)
 
-set.seed(202604)
+set.seed(20260418)
 source("CLEAR.R")
 source("CLEAR-KDE.R")
+source("CLEAR-KNN.R")
 ```
 
 
@@ -45,6 +46,12 @@ profiles <- list(
   group2 = list(mu = c(40, 42, 45, 48), rho = 0.4, skew = 2, sites = shuffled_sites[(size1 + 1):(size1 + size2)]),
   group3 = list(mu = c(25, 28, 30, 32), rho = 0.2, skew = 0, sites = shuffled_sites[(size1 + size2 + 1):M])
 )
+# 
+# profiles <- list(
+#   group1 = list(mu = c(0, 0, 0, 0), rho = 0.6, skew = 0, sites = shuffled_sites[1:size1]),
+#   group2 = list(mu = c(0, 0, 0, 0), rho = 0.4, skew = 0, sites = shuffled_sites[(size1 + 1):(size1 + size2)]),
+#   group3 = list(mu = c(0, 0, 0, 0), rho = 0.2, skew = 0, sites = shuffled_sites[(size1 + size2 + 1):M])
+# )
 
 site_data_list <- list()
 variable_sd <- runif(d, min = 5, max = 20)
@@ -81,8 +88,9 @@ We run the CLEAR protocol to estimate local density ratios and generate the augm
 
 ```{r run_CLEAR}
 # RUN CLEAR
-CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1.5)
-# CLEAR_results <- CLEAR_KDE(site_data_list, K_comp = 3, n_0 = 1000, inf_cfactor = 1.5)
+CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
+# CLEAR_results <- CLEAR_KDE(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
+CLEAR_results <- CLEAR_KNN(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 1)
 cat("\n Reference Dataset Dim \n");CLEAR_results$Z_0 %>% dim()
 CLEAR_results <- CLEAR_results
 ```
@@ -92,7 +100,7 @@ CLEAR_results <- CLEAR_results
 Comparing the IPW estimates from the CLEAR pipeline directly against the empirical truth for Site 1.
 
 ```{r eval_stats}
-target_site <- 1
+target_site <- 5
 truth_site1 <- calc_empirical_truth(site_data_list[[target_site]])
 est_site1 <- CLEAR_results[[paste0("Site_", target_site)]]
 

@@ -1,10 +1,10 @@
 library(MASS)
 library(mclust)
-# library(glmnet)
+library(caret)  # For KNN and data partitioning
 
 #' Applies local GMMs, creates a global reference distribution, and estimates IPW 
-#' weights via quadratic logistic regression to recover EDA statistics.
-CLEAR <- function(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 2) {
+#' weights via KNN Classification to recover federated statistics.
+CLEAR_KNN <- function(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 2, k_neighbors = 25) {
   H <- length(site_data_list)
   var_names <- colnames(site_data_list[[1]])
   d <- length(var_names)
@@ -12,72 +12,79 @@ CLEAR <- function(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 2) {
   n_h_vec <- sapply(site_data_list, nrow)
   prob_h <- n_h_vec / sum(n_h_vec)
   
-  # Step 1: Local GMMs
+  # --- Step 1 & 2: Local GMMs and Reference Data Generation ---
+  # (Keeping your original logic for GMM generation)
   site_models <- list()
   for (h in 1:H) {
     df_h <- site_data_list[[h]]
-    fit <- Mclust(df_h, G = K_comp, modelNames = "VVV", verbose = FALSE) # EM for GMM
+    fit <- Mclust(df_h, G = K_comp, modelNames = "VVV", verbose = FALSE)
     if (is.null(fit)) fit <- Mclust(df_h, G = 1:K_comp, verbose = FALSE)
-    # if (is.null(fit)) fit <- Mclust(df_h, G = 1, verbose = FALSE)
-    
     site_models[[h]] <- list(pi = fit$parameters$pro, 
                              mu = as.matrix(fit$parameters$mean), 
                              Sigma = fit$parameters$variance$sigma)
   }
   
-  # Step 2: Reference Data
   Z_0 <- matrix(0, nrow = n_0, ncol = d)
   for (i in 1:n_0) {
     h <- sample(1:H, 1, prob = prob_h)
     m <- site_models[[h]]
-    
-    if (is.null(m$pi)) { k <- 1 } else { k <- sample(1:length(m$pi), 1, prob = m$pi) }
+    k <- if (is.null(m$pi)) 1 else sample(1:length(m$pi), 1, prob = m$pi)
     mu_hk <- m$mu[, k]
-    if (length(dim(m$Sigma)) == 3) { Sigma_hk <- m$Sigma[,, k] } else { Sigma_hk <- m$Sigma }
-    
-    Sigma_inflated <- Sigma_hk * inf_factor
-    Z_0[i, ] <- mvrnorm(n = 1, mu = mu_hk, Sigma = Sigma_inflated)
+    Sigma_hk <- if (length(dim(m$Sigma)) == 3) m$Sigma[,, k] else m$Sigma
+    Z_0[i, ] <- mvrnorm(n = 1, mu = mu_hk, Sigma = Sigma_hk * inf_cfactor)
   }
   Z_0 <- as.data.frame(Z_0)
   colnames(Z_0) <- var_names
   
-  # Step 3 & 4: IPW and Get EDA stats
-  quad_terms <- paste0("I(", var_names, "^2)", collapse = " + ")
-  poly_form <- as.formula(paste("~ .^2 +", quad_terms))
-
+  # --- Step 3: Density Ratio Estimation via KNN ---
   results_list <- list()
+  
   for (h in 1:H) {
     df_h <- site_data_list[[h]]
     n_h <- nrow(df_h)
-    Z_comb <- rbind(df_h, Z_0)
-    Y_comb <- c(rep(1, n_h), rep(0, n_0))
-    Z_poly <- as.data.frame(model.matrix(poly_form, data = Z_comb))
-    Z_poly$Y_comb <- Y_comb
     
-    # # standardize Z_poly (exclude Y_comb)
-    # feature_cols <- setdiff(colnames(Z_poly), "Y_comb")
-    # Z_poly[feature_cols] <- scale(Z_poly[feature_cols])
-    # print(h); print(table(Z_poly$Y_comb))
+    # Prepare training data: Site h (Class 1) and Reference Z_0 (Class 0)
+    # Note: KNN is sensitive to scale; standardization is mandatory here
+    X_train <- rbind(df_h, Z_0)
+    Y_train <- as.factor(c(rep("Local", n_h), rep("Ref", n_0)))
     
-    glm_fit <- suppressWarnings(glm(Y_comb ~ . -1, data = Z_poly, family = binomial))
-    # check glm_fit convergence
-    if (!glm_fit$converged) {warning(sprintf("GLM did not converge for Site %d", h))}
-  
-    Z0_poly <- Z_poly[(n_h + 1):nrow(Z_poly), ]
-    prob <- predict(glm_fit, newdata = Z0_poly, type = "response")
+    # KNN Prediction for Z_0
+    # We use knn() from the 'class' package with prob = TRUE
+    # This returns the proportion of the votes for the winning class
+    library(class)
+    
+    # Pre-scaling both datasets based on combined data
+    X_train_scaled <- scale(X_train)
+    Z_0_scaled <- X_train_scaled[(n_h + 1):(n_h + n_0), , drop = FALSE]
+    Site_h_scaled <- X_train_scaled[1:n_h, , drop = FALSE]
+    
+    # Run KNN to get probabilities that Z_0 belongs to the 'Local' class
+    # We predict classes for every point in Z_0
+    knn_fit <- knn(train = X_train_scaled, test = Z_0_scaled, 
+                   cl = Y_train, k = k_neighbors, prob = TRUE)
+    
+    # Extract the probability of the winning class
+    winning_prob <- attr(knn_fit, "prob")
+    
+    # Convert 'winning prob' to 'probability of being Local'
+    # If knn predicted 'Ref', the prob of 'Local' is (1 - winning_prob)
+    prob <- ifelse(knn_fit == "Local", winning_prob, 1 - winning_prob)
+    
+    # --- Step 4: Weighting and Stats ---
+    # Bound probabilities to avoid infinity in odds ratio
     prob <- pmin(pmax(prob, 1e-6), 1 - 1e-6)
-
+    
     omega <- (n_0 / n_h) * (prob / (1 - prob)) 
     threshold <- quantile(omega, 0.99, na.rm = TRUE)
     w_h <- pmin(omega, threshold)
     w_norm <- w_h / sum(w_h)
-
+    
     site_stats <- list(
       Mean = numeric(d), Variance = numeric(d), 
       Skewness = numeric(d), Kurtosis = numeric(d), 
       Covariance = matrix(0, nrow=d, ncol=d)
     )
-
+    
     names(site_stats$Mean) <- names(site_stats$Variance) <- names(site_stats$Skewness) <- names(site_stats$Kurtosis) <- var_names
     rownames(site_stats$Covariance) <- colnames(site_stats$Covariance) <- var_names
     
@@ -104,8 +111,6 @@ CLEAR <- function(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 2) {
   results_list$Z_0 <- Z_0 
   return(results_list)
 }
-
-
 
 #' Helper to calculate exact empirical moments of the raw data (Truth)
 calc_empirical_truth <- function(df) {
