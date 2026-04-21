@@ -1,7 +1,6 @@
 library(MASS)
 library(mclust)
-library(caret) 
-library(class)
+library(caret)  # For KNN and data partitioning
 
 #' Applies local GMMs, creates a global reference distribution, and estimates IPW 
 #' weights via KNN Classification to recover federated statistics.
@@ -14,6 +13,7 @@ CLEAR_KNN <- function(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 2, 
   prob_h <- n_h_vec / sum(n_h_vec)
   
   # --- Step 1 & 2: Local GMMs and Reference Data Generation ---
+  # (Keeping your original logic for GMM generation)
   site_models <- list()
   for (h in 1:H) {
     df_h <- site_data_list[[h]]
@@ -38,25 +38,51 @@ CLEAR_KNN <- function(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 2, 
   
   # --- Step 3: Density Ratio Estimation via KNN ---
   results_list <- list()
-  q_probs <- c(0.05, 0.25, 0.5, 0.75, 0.95) # Probabilities for Quantiles
   
   for (h in 1:H) {
     df_h <- site_data_list[[h]]
     n_h <- nrow(df_h)
     
+    # Prepare training data: Site h (Class 1) and Reference Z_0 (Class 0)
+    # Note: KNN is sensitive to scale; standardization is mandatory here
     X_train <- rbind(df_h, Z_0)
     Y_train <- as.factor(c(rep("Local", n_h), rep("Ref", n_0)))
     
+    # KNN Prediction for Z_0
+    # We use knn() from the 'class' package with prob = TRUE
+    # This returns the proportion of the votes for the winning class
+    library(class)
+    
+    # Pre-scaling both datasets based on combined data
     X_train_scaled <- scale(X_train)
     Z_0_scaled <- X_train_scaled[(n_h + 1):(n_h + n_0), , drop = FALSE]
+    Site_h_scaled <- X_train_scaled[1:n_h, , drop = FALSE]
     
+    # Run KNN to get probabilities that Z_0 belongs to the 'Local' class
+    # We predict classes for every point in Z_0
     knn_fit <- knn(train = X_train_scaled, test = Z_0_scaled, 
                    cl = Y_train, k = k_neighbors, prob = TRUE)
     
+    # Extract the probability of the winning class
     winning_prob <- attr(knn_fit, "prob")
+    
+    # Convert 'winning prob' to 'probability of being Local'
+    # If knn predicted 'Ref', the prob of 'Local' is (1 - winning_prob)
     prob <- ifelse(knn_fit == "Local", winning_prob, 1 - winning_prob)
     
+    
+    # hist(prob, breaks = 50, main = paste("Overlap Check: Site", h),
+    #      xlab = "Probability of belonging to Local Data",
+    #      col = "lightblue", border = "white")
+    # 
+    # # Calculate the Positivity Violation Metric
+    # # What percentage of points have extreme probabilities (> 0.95)?
+    # violation_rate <- mean(prob > 0.95)
+    # cat("Site", h, "Positivity Violation Rate:", round(violation_rate * 100, 2), "%\n")
+    
+    
     # --- Step 4: Weighting and Stats ---
+    # Bound probabilities to avoid infinity in odds ratio
     prob <- pmin(pmax(prob, 1e-6), 1 - 1e-6)
     
     omega <- (n_0 / n_h) * (prob / (1 - prob)) 
@@ -65,36 +91,29 @@ CLEAR_KNN <- function(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 2, 
     w_norm <- w_h / sum(w_h)
     
     site_stats <- list(
-      Mean = numeric(d), 
-      Variance = numeric(d), 
-      Quantiles = matrix(0, nrow=d, ncol=length(q_probs)),
+      Mean = numeric(d), Variance = numeric(d), 
+      Skewness = numeric(d), Kurtosis = numeric(d), 
       Covariance = matrix(0, nrow=d, ncol=d)
     )
     
-    names(site_stats$Mean) <- names(site_stats$Variance) <- var_names
-    rownames(site_stats$Quantiles) <- rownames(site_stats$Covariance) <- colnames(site_stats$Covariance) <- var_names
-    colnames(site_stats$Quantiles) <- c("5%", "25%", "50%", "75%", "95%")
+    names(site_stats$Mean) <- names(site_stats$Variance) <- names(site_stats$Skewness) <- names(site_stats$Kurtosis) <- var_names
+    rownames(site_stats$Covariance) <- colnames(site_stats$Covariance) <- var_names
     
     for (v in 1:d) {
       x <- Z_0[, v]
-      
-      # Mean and Variance
       mu_v <- sum(w_norm * x)
       var_v <- sum(w_norm * (x - mu_v)^2)
+      sd_v <- sqrt(var_v)
       
       site_stats$Mean[v] <- mu_v
       site_stats$Variance[v] <- var_v
-      
-      # Weighted Quantiles (Base R implementation)
-      ord <- order(x)
-      x_ord <- x[ord]
-      w_ord <- w_norm[ord]
-      cum_w <- cumsum(w_ord) 
-      site_stats$Quantiles[v, ] <- sapply(q_probs, function(p) x_ord[which(cum_w >= p)[1]])
+      site_stats$Skewness[v] <- sum(w_norm * (x - mu_v)^3) / (sd_v^3)
+      site_stats$Kurtosis[v] <- sum(w_norm * (x - mu_v)^4) / (sd_v^4)
     }
     
-    # Vectorized Covariance Calculation
-    Z_centered <- sweep(as.matrix(Z_0), 2, site_stats$Mean, FUN = "-")
+
+    mu_vec <- site_stats$Mean
+    Z_centered <- sweep(as.matrix(Z_0), 2, mu_vec, FUN = "-")
     site_stats$Covariance <- t(Z_centered) %*% (Z_centered * w_norm)
     
     site_stats$Weights <- w_norm
@@ -105,32 +124,26 @@ CLEAR_KNN <- function(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 2, 
   return(results_list)
 }
 
-
-#' Helper to calculate exact empirical moments and quantiles of the raw data (Truth)
+#' Helper to calculate exact empirical moments of the raw data (Truth)
 calc_empirical_truth <- function(df) {
   n <- nrow(df)
-  
-  # 1. Means
   means <- colMeans(df)
-  
-  # 2. Population Variance (div by n instead of n-1 to match IPW mathematical bounds)
+  # Use population variance formula (div by n) to match IPW formula
   vars <- apply(df, 2, function(x) sum((x - mean(x))^2) / n) 
+  sds <- sqrt(vars)
   
-  # 3. Empirical Quantiles (Replacing Skewness and Kurtosis)
-  q_probs <- c(0.05, 0.25, 0.50, 0.75, 0.95)
+  skew <- numeric(ncol(df)); kurt <- numeric(ncol(df))
+  for(v in 1:ncol(df)) {
+    x <- df[, v]
+    skew[v] <- sum((x - means[v])^3 / n) / (sds[v]^3)
+    kurt[v] <- sum((x - means[v])^4 / n) / (sds[v]^4)
+  }
+  names(skew) <- names(kurt) <- colnames(df)
   
-  # apply() returns quantiles as rows and variables as columns. 
-  # We transpose t() it so rows are variables, matching the CLEAR algorithm output.
-  quant <- t(apply(df, 2, quantile, probs = q_probs))
-  colnames(quant) <- c("5%", "25%", "50%", "75%", "95%")
-  
-  # 4. Population Covariance Matrix
+  # Population covariance matrix
   cov_mat <- cov(df) * ((n - 1) / n)
   
-  list(
-    Mean = means, 
-    Variance = vars, 
-    Quantiles = quant, 
-    Covariance = cov_mat
-  )
+  list(Mean = means, Variance = vars, 
+       Skewness = skew, Kurtosis = kurt, 
+       Covariance = cov_mat)
 }
