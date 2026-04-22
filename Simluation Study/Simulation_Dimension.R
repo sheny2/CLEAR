@@ -143,4 +143,4 @@ eval_plot <- ggplot(results_long, aes(x = Dimension, y = MAE, fill = Dimension))
   )
 
 # save the plot
-ggsave("CLEAR_Simulation_Evaluation.png", eval_plot, width = 12, height = 8, dpi = 300)
+ggsave("Simulation_Dimension.png", eval_plot, width = 12, height = 8, dpi = 300)
