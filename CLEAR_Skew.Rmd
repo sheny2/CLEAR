@@ -17,9 +17,8 @@ library(sn)
 library(tidyverse)
 library(glmnet)
 
-set.seed(202604)
+# set.seed(202604)
 source("CLEAR.R")
-source("CLEAR-KDE.R")
 source("CLEAR-KNN.R")
 ```
 

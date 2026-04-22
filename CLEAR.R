@@ -59,6 +59,12 @@ CLEAR <- function(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 2) {
     
     Z0_poly <- Z_poly[(n_h + 1):nrow(Z_poly), ]
     prob <- predict(glm_fit, newdata = Z0_poly, type = "response")
+    
+    # hist(prob, breaks = 50, main = paste("Overlap Check: Site", h),
+    #      xlab = "Probability of belonging to Local Data",
+    #      col = "lightblue", border = "white")
+    
+    
     prob <- pmin(pmax(prob, 1e-6), 1 - 1e-6)
     
     omega <- (n_0 / n_h) * (prob / (1 - prob)) 

@@ -55,7 +55,7 @@ doParallel::registerDoParallel(cl)
 # 3. Parallel Simulation Execution
 # =====================================================================
 d_values <- c(5, 10, 20, 30)
-n_sims <- 50
+n_sims <- 100
 target_site <- 1
 
 # Flatten the loops into a single grid of tasks for optimal load balancing
