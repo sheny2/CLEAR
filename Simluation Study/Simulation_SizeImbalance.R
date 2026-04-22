@@ -10,20 +10,24 @@ library(parallelly)
 
 source("CLEAR.R")
 
-# 1. Generalized DGP Function & Helper Functions 
-generate_scalable_dgp <- function(M = 5, d = 5) {
-  n_k <- sample(300:600, M, replace = TRUE)
+# =====================================================================
+# 1. Imbalance-Aware DGP Function
+# =====================================================================
+# We modify the DGP to accept an exact vector of sample sizes (n_k_vec)
+generate_imbalanced_dgp <- function(n_k_vec, d = 5) {
+  M <- length(n_k_vec)
   site_data_list <- list()
   
   for (k in 1:M) {
+    # Generate distinct geometries for each site
     rho <- runif(1, 0.2, 0.7)
     R <- matrix(rho, nrow = d, ncol = d)
     diag(R) <- 1
     
-    Z <- mvrnorm(n = n_k[k], mu = rep(0, d), Sigma = R)
+    Z <- mvrnorm(n = n_k_vec[k], mu = rep(0, d), Sigma = R)
     U <- pnorm(Z)
     
-    df_sim <- data.frame(matrix(ncol = d, nrow = n_k[k]))
+    df_sim <- data.frame(matrix(ncol = d, nrow = n_k_vec[k]))
     for(v in 1:d) {
       if (v %% 4 == 1) {
         df_sim[, v] <- qnorm(U[, v], mean = 50 + k*2, sd = 10)
@@ -44,7 +48,6 @@ generate_scalable_dgp <- function(M = 5, d = 5) {
 # =====================================================================
 # 2. Parallel Cluster Setup
 # =====================================================================
-# Dynamically detect cores and leave 1 free for system stability
 n_cores <- parallelly::availableCores() - 1
 cat(sprintf("Initializing Parallel Cluster with %d cores...\n", n_cores))
 
@@ -52,32 +55,43 @@ cl <- parallel::makeCluster(n_cores)
 doParallel::registerDoParallel(cl)
 
 # =====================================================================
-# 3. Parallel Simulation Execution
+# 3. Define Imbalance Scenarios
 # =====================================================================
-d_values <- c(5, 10, 20, 30)
-n_sims <- 50
-target_site <- 1
+# Total network N = 2000 across 5 sites.
+# We progressively shift data from the satellite sites to Site 1.
+scenarios <- list(
+  "1_Balanced" = c(400, 400, 400, 400, 400),
+  "2_Slight"   = c(800, 400, 300, 300, 200),
+  "3_Moderate" = c(1200, 300, 200, 150, 150),
+  "4_Extreme"  = c(1600, 100, 100, 100, 100),
+  "5_Severe"   = c(1800, 50, 50, 50, 50)
+)
 
-# Flatten the loops into a single grid of tasks for optimal load balancing
-sim_grid <- expand.grid(Dimension = d_values, Simulation = 1:n_sims)
+fixed_d <- 5 
+n_sims <- 100
+# CRITICAL: We evaluate the LAST site (Site 5), which is always the smallest.
+# We want to see if the massive Site 1 destroys the estimates for the tiny Site 5.
+target_site <- 5 
+
+# Flatten the loops into a single grid of tasks
+sim_grid <- expand.grid(Scenario = names(scenarios), Simulation = 1:n_sims)
 total_tasks <- nrow(sim_grid)
 
-cat(sprintf("Starting %d total simulation tasks...\n", total_tasks))
-
+cat(sprintf("Starting %d total simulation tasks for Sample Size Imbalance...\n", total_tasks))
 
 sim_results <- foreach(
   i = 1:total_tasks, 
   .combine = rbind,
   .packages = c("MASS", "mclust", "class")
-  # .export = c("generate_scalable_dgp", "calc_empirical_truth", "CLEAR", "target_site")
 ) %dopar% {
   
   # Extract current task parameters
-  d <- sim_grid$Dimension[i]
+  scen_name <- as.character(sim_grid$Scenario[i])
+  n_k_vec <- scenarios[[scen_name]]
   sim <- sim_grid$Simulation[i]
   
-  # 1. Generate Data
-  site_data_list <- generate_scalable_dgp(M = 5, d = d)
+  # 1. Generate Data 
+  site_data_list <- generate_imbalanced_dgp(n_k_vec = n_k_vec, d = fixed_d)
   truth_site <- calc_empirical_truth(site_data_list[[target_site]])
   
   # 2. Run CLEAR 
@@ -99,7 +113,8 @@ sim_results <- foreach(
     mae_cov   <- mean(abs(est_site$Covariance - truth_site$Covariance))
     
     return(data.frame(
-      Dimension = d,
+      Scenario = scen_name,
+      Target_N = n_k_vec[target_site], # Track the sample size of the site being evaluated
       Simulation = sim,
       Mean_Error = mae_mean,
       Var_Error = mae_var,
@@ -107,7 +122,7 @@ sim_results <- foreach(
       Covariance_Error = mae_cov
     ))
   } else {
-    return(NULL) # Drops the row if GLM failed
+    return(NULL)
   }
 }
 
@@ -116,28 +131,43 @@ parallel::stopCluster(cl)
 # =====================================================================
 # 4. Data Transformation and Plotting
 # =====================================================================
+# Format scenario names for cleaner plotting
 results_long <- sim_results %>%
-  pivot_longer(cols = ends_with("Error"), 
-               names_to = "Metric", 
-               values_to = "MAE") %>%
-  mutate(Metric = factor(Metric, levels = c("Mean_Error", "Var_Error", "Quantile_Error", "Covariance_Error")),
-         Dimension = as.factor(Dimension))
+  mutate(
+    Scenario_Label = case_when(
+      Scenario == "1_Balanced" ~ "Balanced\n(Target N=400)",
+      Scenario == "2_Slight"   ~ "Slight\n(Target N=200)",
+      Scenario == "3_Moderate" ~ "Moderate\n(Target N=150)",
+      Scenario == "4_Extreme"  ~ "Extreme\n(Target N=100)",
+      Scenario == "5_Severe"   ~ "Severe\n(Target N=50)"
+    )
+  ) %>%
+  mutate(Scenario_Label = factor(Scenario_Label, levels = c(
+    "Balanced\n(Target N=400)", 
+    "Slight\n(Target N=200)", 
+    "Moderate\n(Target N=150)", 
+    "Extreme\n(Target N=100)", 
+    "Severe\n(Target N=50)"
+  ))) %>%
+  pivot_longer(cols = ends_with("Error"), names_to = "Metric", values_to = "MAE") %>%
+  mutate(Metric = factor(Metric, levels = c("Mean_Error", "Var_Error", "Quantile_Error", "Covariance_Error")))
 
-eval_plot <- ggplot(results_long, aes(x = Dimension, y = MAE, fill = Dimension)) +
+eval_plot <- ggplot(results_long, aes(x = Scenario_Label, y = MAE, fill = Scenario_Label)) +
   geom_boxplot(alpha = 0.7, outlier.size = 1, outlier.alpha = 0.5) +
   facet_wrap(~ Metric, scales = "free_y", ncol = 2) +
   theme_bw(base_size = 14) +
   labs(
-    title = "CLEAR Algorithm Performance by Dimensionality",
-    subtitle = paste("Mean Absolute Error (Target Site", target_site, ")"),
-    x = "Number of Covariates (d)",
+    title = "CLEAR Robustness to Network Sample Size Imbalance",
+    subtitle = "Evaluating performance on the smallest satellite site across increasingly imbalanced networks",
+    x = "Network Imbalance Scenario",
     y = "Mean Absolute Error (MAE)"
   ) +
   theme(
     legend.position = "none",
     strip.background = element_rect(fill = "#f0f0f0"),
-    strip.text = element_text(face = "bold")
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
   )
 
 # save the plot
-ggsave("Results/Simulation_Dimension.png", eval_plot, width = 12, height = 8, dpi = 300)
+ggsave("Results/Simulation_Imbalance.png", eval_plot, width = 12, height = 8, dpi = 300)

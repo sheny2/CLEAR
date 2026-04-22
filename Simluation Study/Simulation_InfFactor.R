@@ -10,7 +10,9 @@ library(parallelly)
 
 source("CLEAR.R")
 
-# 1. Generalized DGP Function & Helper Functions 
+# =====================================================================
+# 1. Generalized DGP Function
+# =====================================================================
 generate_scalable_dgp <- function(M = 5, d = 5) {
   n_k <- sample(300:600, M, replace = TRUE)
   site_data_list <- list()
@@ -44,7 +46,6 @@ generate_scalable_dgp <- function(M = 5, d = 5) {
 # =====================================================================
 # 2. Parallel Cluster Setup
 # =====================================================================
-# Dynamically detect cores and leave 1 free for system stability
 n_cores <- parallelly::availableCores() - 1
 cat(sprintf("Initializing Parallel Cluster with %d cores...\n", n_cores))
 
@@ -54,38 +55,39 @@ doParallel::registerDoParallel(cl)
 # =====================================================================
 # 3. Parallel Simulation Execution
 # =====================================================================
-d_values <- c(5, 10, 20, 30)
-n_sims <- 50
+# We vary the inflation factor while keeping dimensions and N0 fixed
+inf_values <- c(1.0, 1.5, 2.0, 3.0, 5.0)
+fixed_d <- 5 
+fixed_n0 <- 10000 
+n_sims <- 100
 target_site <- 1
 
-# Flatten the loops into a single grid of tasks for optimal load balancing
-sim_grid <- expand.grid(Dimension = d_values, Simulation = 1:n_sims)
+# Flatten the loops into a single grid of tasks
+sim_grid <- expand.grid(InfFactor = inf_values, Simulation = 1:n_sims)
 total_tasks <- nrow(sim_grid)
 
-cat(sprintf("Starting %d total simulation tasks...\n", total_tasks))
-
+cat(sprintf("Starting %d total simulation tasks for varying Inflation Factor...\n", total_tasks))
 
 sim_results <- foreach(
   i = 1:total_tasks, 
   .combine = rbind,
   .packages = c("MASS", "mclust", "class")
-  # .export = c("generate_scalable_dgp", "calc_empirical_truth", "CLEAR", "target_site")
 ) %dopar% {
   
   # Extract current task parameters
-  d <- sim_grid$Dimension[i]
+  current_inf <- sim_grid$InfFactor[i]
   sim <- sim_grid$Simulation[i]
   
-  # 1. Generate Data
-  site_data_list <- generate_scalable_dgp(M = 5, d = d)
+  # 1. Generate Data (Fixed dimension)
+  site_data_list <- generate_scalable_dgp(M = 5, d = fixed_d)
   truth_site <- calc_empirical_truth(site_data_list[[target_site]])
   
-  # 2. Run CLEAR 
+  # 2. Run CLEAR with the varying inflation factor
   est_site <- tryCatch({
-    res <- CLEAR(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 1.5)
+    res <- CLEAR(site_data_list, K_comp = 2, n_0 = fixed_n0, inf_factor = current_inf)
     res[[paste0("Site_", target_site)]]
   }, warning = function(w) {
-    res <- suppressWarnings(CLEAR(site_data_list, K_comp = 2, n_0 = 10000, inf_factor = 1.5))
+    res <- suppressWarnings(CLEAR(site_data_list, K_comp = 2, n_0 = fixed_n0, inf_factor = current_inf))
     res[[paste0("Site_", target_site)]]
   }, error = function(e) {
     return(NULL) 
@@ -99,7 +101,7 @@ sim_results <- foreach(
     mae_cov   <- mean(abs(est_site$Covariance - truth_site$Covariance))
     
     return(data.frame(
-      Dimension = d,
+      InfFactor = current_inf,
       Simulation = sim,
       Mean_Error = mae_mean,
       Var_Error = mae_var,
@@ -107,7 +109,7 @@ sim_results <- foreach(
       Covariance_Error = mae_cov
     ))
   } else {
-    return(NULL) # Drops the row if GLM failed
+    return(NULL)
   }
 }
 
@@ -121,17 +123,18 @@ results_long <- sim_results %>%
                names_to = "Metric", 
                values_to = "MAE") %>%
   mutate(Metric = factor(Metric, levels = c("Mean_Error", "Var_Error", "Quantile_Error", "Covariance_Error")),
-         Dimension = as.factor(Dimension))
+         InfFactor = as.factor(InfFactor)) # Convert to InfFactor for boxplots
 
-eval_plot <- ggplot(results_long, aes(x = Dimension, y = MAE, fill = Dimension)) +
+eval_plot <- ggplot(results_long, aes(x = InfFactor, y = MAE, fill = InfFactor)) +
   geom_boxplot(alpha = 0.7, outlier.size = 1, outlier.alpha = 0.5) +
   facet_wrap(~ Metric, scales = "free_y", ncol = 2) +
   theme_bw(base_size = 14) +
   labs(
-    title = "CLEAR Algorithm Performance by Dimensionality",
-    subtitle = paste("Mean Absolute Error (Target Site", target_site, ")"),
-    x = "Number of Covariates (d)",
-    y = "Mean Absolute Error (MAE)"
+    title = "CLEAR Algorithm Performance by Covariance Inflation Factor",
+    subtitle = bquote("Mean Absolute Error (Target Site" ~ .(target_site) ~ "|" ~ d == .(fixed_d) ~ "|" ~ n[0] == .(fixed_n0) * ")"),
+    x = "Covariance Inflation Factor (inf_factor)",
+    y = "Mean Absolute Error (MAE)",
+    fill = "Inflation\nFactor"
   ) +
   theme(
     legend.position = "none",
@@ -140,4 +143,4 @@ eval_plot <- ggplot(results_long, aes(x = Dimension, y = MAE, fill = Dimension))
   )
 
 # save the plot
-ggsave("Results/Simulation_Dimension.png", eval_plot, width = 12, height = 8, dpi = 300)
+ggsave("Results/Simulation_InfFactor.png", eval_plot, width = 12, height = 8, dpi = 300)
