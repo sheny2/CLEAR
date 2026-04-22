@@ -86,9 +86,9 @@ We run the CLEAR protocol to estimate local density ratios and generate the augm
 
 ```{r run_CLEAR}
 # RUN CLEAR
-# CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
+CLEAR_results <- CLEAR(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
 # CLEAR_results <- CLEAR_KDE(site_data_list, K_comp = 3, n_0 = 10000, inf_factor = 1)
-CLEAR_results <- CLEAR_KNN(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 1)
+# CLEAR_results <- CLEAR_KNN(site_data_list, K_comp = 3, n_0 = 10000, inf_cfactor = 1)
 cat("\n Reference Dataset Dim \n");CLEAR_results$Z_0 %>% dim()
 CLEAR_results <- CLEAR_results
 ```

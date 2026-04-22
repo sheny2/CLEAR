@@ -42,9 +42,9 @@ shuffled_sites <- sample(1:M)
 size1 = size2 = round(M/3)
 size3 <- M - (size1 + size2) 
 profiles <- list(
-  group1 = list(mu = c(50, 55, 60, 65), rho = 0.6, skew = 5, sites = shuffled_sites[1:size1]),
-  group2 = list(mu = c(40, 42, 45, 48), rho = 0.4, skew = 2, sites = shuffled_sites[(size1 + 1):(size1 + size2)]),
-  group3 = list(mu = c(25, 28, 30, 32), rho = 0.2, skew = 0, sites = shuffled_sites[(size1 + size2 + 1):M])
+  group1 = list(mu = c(50, 55, 60, 65), rho = 0.6, skew = 15, sites = shuffled_sites[1:size1]),
+  group2 = list(mu = c(40, 42, 45, 48), rho = 0.4, skew = 20, sites = shuffled_sites[(size1 + 1):(size1 + size2)]),
+  group3 = list(mu = c(25, 28, 30, 32), rho = 0.2, skew = 10, sites = shuffled_sites[(size1 + size2 + 1):M])
 )
 
 site_data_list <- list()
