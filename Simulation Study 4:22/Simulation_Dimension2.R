@@ -48,7 +48,7 @@ cl <- parallel::makeCluster(n_cores)
 doParallel::registerDoParallel(cl)
 
 d_values <- c(5, 10, 20, 30)
-n_sims <- 5
+n_sims <- 500
 target_site <- 1
 fixed_n0 <- 10000
 fixed_inf <- 1.5
