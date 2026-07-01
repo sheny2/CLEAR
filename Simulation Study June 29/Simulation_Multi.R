@@ -8,17 +8,10 @@
 #     3-mixture    : c(1/3, 1/3, 1/3, 0  )
 #     4-mixture    : c(.25, .25, .25, .25)
 #
-# 500 iterations per setting, parallel over parallel::detectCores().
 # Each iteration: generate data -> run CLEAR -> compute global estimates ->
 # compare to pooled empirical truth for: Mean, Variance, Covariance,
 # Quantiles, and Lasso coefficients (X1 ~ X2 + X3).
 #
-# Per-iteration summary metric per statistic = RELATIVE RMSE:
-#     sqrt(mean((est - truth)^2)) / (sqrt(mean(truth^2)) + eps)
-# so all five statistics share a comparable scale.
-#
-# Output: ONE figure faceted by statistic (x = DGP setting), plus a CSV.
-# Requires CLEAR.R (as in CLEAR_Single_Sim.R).
 # =============================================================================
 
 rm(list = ls())
@@ -208,7 +201,7 @@ summary_tbl <- aggregate(Bias ~ Setting + Statistic + Quantity, data = long,
                                              sd = sd(x)))
 summary_tbl <- do.call(data.frame, summary_tbl)
 print(summary_tbl, digits = 4, row.names = FALSE)
-write.csv(summary_tbl, "CLEAR_study_bias_summary.csv", row.names = FALSE)
+write.csv(summary_tbl, "CLEAR_study_summary.csv", row.names = FALSE)
 
 
 
@@ -249,10 +242,7 @@ for (st in levels(long$Statistic)) {
   if (!any(long$Statistic == st)) next
   p_st <- make_stat_plot(st)
   n_q  <- length(unique(long$Quantity[long$Statistic == st]))
-  ggsave(sprintf("CLEAR_study_bias_%s.png", st), p_st,
+  ggsave(sprintf("CLEAR_study_%s.png", st), p_st,
          width = max(6, n_q * 2.2), height = 4.2, dpi = 150, limitsize = FALSE)
   print(p_st)
 }
-
-cat("\nSaved: CLEAR_study_bias_summary.csv and per-statistic plots ",
-    "(CLEAR_study_bias_Mean.png, _Var.png, _Cov.png, _Quantile.png, _Lasso.png)\n", sep = "")

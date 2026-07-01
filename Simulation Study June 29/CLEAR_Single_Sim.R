@@ -20,7 +20,7 @@ library(glmnet)
 
 source("CLEAR.R")
 
-set.seed(2026)
+# set.seed(2026)
 
 # -----------------------------------------------------------------------------
 # 0. CONFIG -- edit PROPORTIONS to change the DGP shape
@@ -34,7 +34,7 @@ N_SITES <- 5
 D       <- 3
 VAR_NMS <- c("X1", "X2", "X3")
 K_COMP  <- 4                 
-N_0     <- 20000
+N_0     <- 10000
 SITE_N  <- seq(200, 800, length.out = N_SITES)  # per-site sample sizes
 Q_PROBS <- c(0.05, 0.25, 0.50, 0.75, 0.95)
 Q_LABS  <- c("5%", "25%", "50%", "75%", "95%")
