@@ -25,7 +25,7 @@ set.seed(2026)
 # -----------------------------------------------------------------------------
 # 0. CONFIG -- edit PROPORTIONS to change the DGP shape
 # -----------------------------------------------------------------------------
-PROPORTIONS <- c(0.3, 0.3, 0.2, 0.2)   
+PROPORTIONS <- c(0.5, 0.4, 0.1, 0)   
 
 stopifnot(length(PROPORTIONS) == 4, all(PROPORTIONS >= 0), sum(PROPORTIONS) > 0)
 PROPORTIONS <- PROPORTIONS / sum(PROPORTIONS)   # normalize
