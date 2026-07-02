@@ -33,7 +33,7 @@ PROPORTIONS <- PROPORTIONS / sum(PROPORTIONS)   # normalize
 N_SITES <- 5
 D       <- 3
 VAR_NMS <- c("X1", "X2", "X3")
-K_COMP  <- 4                 
+K_COMP  <- 3                 
 N_0     <- 10000
 SITE_N  <- seq(200, 800, length.out = N_SITES)  # per-site sample sizes
 Q_PROBS <- c(0.05, 0.25, 0.50, 0.75, 0.95)
@@ -264,7 +264,7 @@ lasso_tbl <- data.frame(
 cat("\n================= (D) LASSO COEFFICIENTS =================\n")
 cat(sprintf("Model: %s ~ %s  (lambda.min)\n", outcome, paste(predictors, collapse = " + ")))
 print(lasso_tbl, row.names = FALSE)
-write.csv(lasso_tbl, "CLEAR4_lasso_comparison.csv", row.names = FALSE)
+# write.csv(lasso_tbl, "CLEAR4_lasso_comparison.csv", row.names = FALSE)
 
 path_df <- function(fit, label) {
   B <- as.matrix(fit$glmnet.fit$beta)
