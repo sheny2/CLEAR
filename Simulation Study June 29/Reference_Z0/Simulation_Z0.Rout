@@ -1,0 +1,609 @@
+
+R version 4.3.1 Patched (2023-07-19 r84711) -- "Beagle Scouts"
+Copyright (C) 2023 The R Foundation for Statistical Computing
+Platform: x86_64-conda-linux-gnu (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+[Previously saved workspace restored]
+
+> # =============================================================================
+> # CLEAR parallel simulation study -- performance across REFERENCE SAMPLE SIZE
+> # -----------------------------------------------------------------------------
+> # K is FIXED at 3 for BOTH the DGP and CLEAR. The DGP uses the 3-mixture
+> # proportions c(1/3, 1/3, 1/3, 0) throughout. Instead of varying DGP
+> # complexity, we vary the reference-distribution sample size n_0 to see how
+> # it affects the recovery of pooled statistics.
+> #
+> # Settings (only n_0 varies):
+> #     n_0 = 1000, 2500, 5000, 10000, 20000, 40000
+> #
+> # 500 iterations per setting, parallel over available cores.
+> # Each iteration: generate data -> run CLEAR -> compute global estimates ->
+> # compare to pooled empirical truth for: Mean, Variance, Covariance,
+> # Quantiles, and Lasso coefficients (X1 ~ X2 + X3).
+> #
+> # Per-element summary metric per statistic = SIGNED BIAS (estimate - truth).
+> #
+> # Output: per-statistic figures (x = n_0) plus a CSV summary.
+> # Requires CLEAR.R.
+> # =============================================================================
+> 
+> rm(list = ls())
+> library(parallel)
+> library(MASS)
+> library(mclust)
+Package 'mclust' version 6.0.0
+Type 'citation("mclust")' for citing this R package in publications.
+> library(glmnet)
+Loading required package: Matrix
+Loaded glmnet 4.1-8
+> library(ggplot2)
+> 
+> source("CLEAR.R")
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 0. Fixed configuration
+> # -----------------------------------------------------------------------------
+> N_ITER  <- 500
+> N_SITES <- 10
+> D       <- 3
+> VAR_NMS <- c("X1", "X2", "X3")
+> K_COMP  <- 3                              # FIXED for CLEAR
+> SITE_N  <- round(seq(200, 800, length.out = N_SITES))
+> Q_PROBS <- c(0.05, 0.25, 0.50, 0.75, 0.95)
+> EPS     <- 1e-8
+> 
+> # DGP proportions are FIXED at the 3-mixture (K = 3) throughout.
+> DGP_PROPS <- c(1/3, 1/3, 1/3, 0)
+> 
+> # The settings we now sweep over: reference sample size n_0.
+> N0_GRID <- c(1000, 2500, 5000, 10000, 20000, 40000)
+> SETTINGS <- setNames(as.list(N0_GRID), paste0("n0=", N0_GRID))
+> 
+> # Fixed DGP component bank (same as before).
+> COMP_CENTERS <- list(c( 0,  0,  0), c( 4,  4, -3),
++                      c(-4,  3,  3), c( 3, -4,  4))
+> comp_cov <- function(s, rho) { M <- matrix(rho, D, D); diag(M) <- 1; (s^2) * M }
+> COMP_COVS <- list(comp_cov(1.0,  0.3), comp_cov(1.4, -0.2),
++                   comp_cov(1.1,  0.1), comp_cov(1.3, -0.3))
+> site_offset <- function(h) c((h - 3) * 1.5, (h - 3) * -1.0, (h - 3) * 0.8)
+> 
+> draw_site <- function(h, n, props) {
++   off  <- site_offset(h)
++   comp <- sample(seq_len(4), n, replace = TRUE, prob = props)
++   X <- matrix(0, n, D)
++   for (k in unique(comp)) {
++     idx <- which(comp == k)
++     X[idx, ] <- mvrnorm(length(idx), mu = COMP_CENTERS[[k]] + off, Sigma = COMP_COVS[[k]])
++   }
++   df <- as.data.frame(X); colnames(df) <- VAR_NMS; df
++ }
+> 
+> rel_rmse <- function(est, truth) {
++   sqrt(mean((est - truth)^2)) / (sqrt(mean(truth^2)) + EPS)
++ }
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 1. One iteration for a given n_0
+> # -----------------------------------------------------------------------------
+> run_one <- function(iter_seed, n0) {
++   set.seed(iter_seed)
++   props <- DGP_PROPS / sum(DGP_PROPS)
++ 
++   site_data <- Map(function(h, n) draw_site(h, n, props), seq_len(N_SITES), SITE_N)
++   pooled    <- do.call(rbind, site_data)
++   n_h       <- sapply(site_data, nrow)
++   w_site    <- n_h / sum(n_h)
++ 
++   truth <- calc_empirical_truth(pooled)
++ 
++   clear <- tryCatch(CLEAR_sim(site_data, K_comp = K_COMP, n_0 = n0, inflate = 1),
++                     error = function(e) NULL)
++   if (is.null(clear)) return(NULL)
++ 
++   Z_0       <- clear$Z_0
++   site_keys <- paste0("Site_", seq_len(N_SITES))
++   w_global  <- Reduce(`+`, Map(function(k, w) w * clear[[k]]$Weights, site_keys, w_site))
++   w_global  <- w_global / sum(w_global)
++ 
++   # --- Global CLEAR estimates ---
++   est_mean <- Reduce(`+`, Map(function(k, w) w * clear[[k]]$Mean, site_keys, w_site))
++   ex2 <- Reduce(`+`, Map(function(k, w) w * (clear[[k]]$Variance + clear[[k]]$Mean^2),
++                          site_keys, w_site))
++   est_var <- ex2 - est_mean^2
++   ecc <- Reduce(`+`, Map(function(k, w) {
++     mu_h <- clear[[k]]$Mean; w * (clear[[k]]$Covariance + outer(mu_h, mu_h))
++   }, site_keys, w_site))
++   est_cov <- ecc - outer(est_mean, est_mean)
++ 
++   est_quant <- t(sapply(seq_len(D), function(v) {
++     x <- Z_0[, v]; ord <- order(x); xo <- x[ord]; cw <- cumsum(w_global[ord])
++     sapply(Q_PROBS, function(p) xo[which(cw >= p)[1]])
++   }))
++ 
++   # --- Lasso: X1 ~ X2 + X3, pooled vs. weighted reference ---
++   lasso_bias <- tryCatch({
++     Xp <- as.matrix(pooled[, c("X2", "X3")]); yp <- pooled[["X1"]]
++     Xr <- as.matrix(Z_0[, c("X2", "X3")]);    yr <- Z_0[["X1"]]
++     set.seed(1); cp <- as.vector(coef(cv.glmnet(Xp, yp, alpha = 1, nfolds = 5), s = "lambda.min"))
++     set.seed(1); cr <- as.vector(coef(cv.glmnet(Xr, yr, alpha = 1, weights = w_global, nfolds = 5),
++                                        s = "lambda.min"))
++     cr - cp   # signed bias per coefficient; truth = pooled-raw lasso coefs
++   }, error = function(e) rep(NA_real_, 3))
++ 
++   # --- Per-element SIGNED BIAS (estimate - truth) ---
++   cov_lt   <- lower.tri(truth$Covariance, diag = TRUE)
++   cov_idx  <- which(cov_lt, arr.ind = TRUE)
++   cov_nms  <- apply(cov_idx, 1, function(ij) paste(VAR_NMS[ij[1]], VAR_NMS[ij[2]], sep = "-"))
++   q_nms    <- as.vector(outer(VAR_NMS, paste0("q", Q_PROBS * 100), paste, sep = "_"))
++ 
++   out <- c(
++     setNames(est_mean - truth$Mean,                          paste0("Mean__",  VAR_NMS)),
++     setNames(est_var  - truth$Variance,                      paste0("Var__",   VAR_NMS)),
++     setNames(est_cov[cov_lt] - truth$Covariance[cov_lt],     paste0("Cov__",   cov_nms)),
++     setNames(as.vector(t(est_quant)) - as.vector(t(truth$Quantiles)),
++              paste0("Quantile__", q_nms)),
++     setNames(lasso_bias,                                     paste0("Lasso__",
++              c("(Intercept)", "X2", "X3")))
++   )
++   out
++ }
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 2. Run all settings in parallel
+> # -----------------------------------------------------------------------------
+> n_cores <- parallelly::availableCores()
+> message(sprintf("Running %d n_0 settings x %d iters on %d cores...",
++                 length(SETTINGS), N_ITER, n_cores))
+Running 6 n_0 settings x 500 iters on 35 cores...
+> 
+> cl <- makeCluster(n_cores)
+> clusterExport(cl, c("N_SITES", "D", "VAR_NMS", "K_COMP", "SITE_N", "Q_PROBS",
++                     "EPS", "DGP_PROPS", "COMP_CENTERS", "COMP_COVS", "comp_cov",
++                     "site_offset", "draw_site", "rel_rmse", "run_one",
++                     "CLEAR_sim", "calc_empirical_truth", "site_fit_gmm",
++                     "center_make_reference", "estimate_ipw_weights", "weighted_eda_stats"))
+> clusterEvalQ(cl, { library(MASS); library(mclust); library(glmnet) })
+[[1]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[2]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[3]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[4]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[5]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[6]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[7]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[8]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[9]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[10]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[11]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[12]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[13]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[14]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[15]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[16]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[17]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[18]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[19]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[20]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[21]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[22]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[23]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[24]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[25]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[26]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[27]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[28]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[29]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[30]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[31]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[32]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[33]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[34]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[35]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+> 
+> all_rows <- list()
+> for (s in names(SETTINGS)) {
++   message("  setting: ", s)
++   seeds <- seq_len(N_ITER) + 1000L * match(s, names(SETTINGS))
++   res   <- parLapply(cl, seeds, run_one, n0 = SETTINGS[[s]])
++   res   <- res[!sapply(res, is.null)]
++   nm    <- names(res[[1]])
++   M     <- do.call(rbind, lapply(res, function(r) r[nm]))
++   colnames(M) <- nm
++   df    <- as.data.frame(M, check.names = FALSE)
++   df$Setting <- s
++   all_rows[[s]] <- df
++   message(sprintf("    %d / %d iterations succeeded.", nrow(df), N_ITER))
++ }
+  setting: n0=1000
+    500 / 500 iterations succeeded.
+  setting: n0=2500
+    500 / 500 iterations succeeded.
+  setting: n0=5000
+    500 / 500 iterations succeeded.
+  setting: n0=10000
+    500 / 500 iterations succeeded.
+  setting: n0=20000
+    500 / 500 iterations succeeded.
+  setting: n0=40000
+    500 / 500 iterations succeeded.
+> stopCluster(cl)
+> 
+> results <- do.call(rbind, all_rows)
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 3. Reshape to long + summary CSV
+> # -----------------------------------------------------------------------------
+> quantity_cols <- setdiff(colnames(results), "Setting")
+> 
+> long <- do.call(rbind, lapply(quantity_cols, function(q) {
++   parts <- strsplit(q, "__", fixed = TRUE)[[1]]
++   data.frame(Setting   = results$Setting,
++              Statistic = parts[1],
++              Quantity  = parts[2],
++              Bias      = results[[q]],
++              stringsAsFactors = FALSE)
++ }))
+> 
+> stat_levels <- c("Mean", "Var", "Cov", "Quantile", "Lasso")
+> long$Setting   <- factor(long$Setting, levels = names(SETTINGS))
+> long$Statistic <- factor(long$Statistic, levels = stat_levels)
+> long$Panel <- factor(paste0(long$Statistic, ": ", long$Quantity),
++                       levels = unique(paste0(long$Statistic, ": ", long$Quantity)))
+> long <- long[is.finite(long$Bias), ]
+> 
+> summary_tbl <- aggregate(Bias ~ Setting + Statistic + Quantity, data = long,
++                          FUN = function(x) c(bias_mean = mean(x), bias_median = median(x),
++                                              sd = sd(x)))
+> summary_tbl <- do.call(data.frame, summary_tbl)
+> print(summary_tbl, digits = 4, row.names = FALSE)
+  Setting Statistic    Quantity Bias.bias_mean Bias.bias_median   Bias.sd
+  n0=1000     Lasso (Intercept)      0.1766745        0.1760672 0.0440411
+  n0=2500     Lasso (Intercept)      0.1004591        0.1005385 0.0195525
+  n0=5000     Lasso (Intercept)      0.0597569        0.0593947 0.0105421
+ n0=10000     Lasso (Intercept)      0.0324228        0.0325776 0.0054620
+ n0=20000     Lasso (Intercept)      0.0174623        0.0173935 0.0029148
+ n0=40000     Lasso (Intercept)      0.0091061        0.0091353 0.0014065
+  n0=1000      Mean          X1      0.0739756        0.0740968 0.0281636
+  n0=2500      Mean          X1      0.0405360        0.0403370 0.0128531
+  n0=5000      Mean          X1      0.0238521        0.0236316 0.0067433
+ n0=10000      Mean          X1      0.0127818        0.0127010 0.0034331
+ n0=20000      Mean          X1      0.0068456        0.0068862 0.0018767
+ n0=40000      Mean          X1      0.0036829        0.0037186 0.0009167
+  n0=1000       Var          X1      0.0931567        0.0842202 0.2856053
+  n0=2500       Var          X1      0.0900670        0.0911929 0.1344690
+  n0=5000       Var          X1      0.0656102        0.0674615 0.0669334
+ n0=10000       Var          X1      0.0393190        0.0370366 0.0366316
+ n0=20000       Var          X1      0.0234690        0.0234486 0.0172745
+ n0=40000       Var          X1      0.0120808        0.0121494 0.0081211
+  n0=1000  Quantile      X1_q25      0.0162500        0.0180247 0.1146541
+  n0=2500  Quantile      X1_q25     -0.0067413       -0.0058377 0.0719350
+  n0=5000  Quantile      X1_q25     -0.0224965       -0.0211337 0.0499550
+ n0=10000  Quantile      X1_q25     -0.0315215       -0.0309281 0.0423947
+ n0=20000  Quantile      X1_q25     -0.0364259       -0.0371234 0.0386538
+ n0=40000  Quantile      X1_q25     -0.0361186       -0.0361683 0.0339695
+  n0=1000  Quantile       X1_q5      0.1559619        0.1562346 0.1762792
+  n0=2500  Quantile       X1_q5      0.1081575        0.1004586 0.1159467
+  n0=5000  Quantile       X1_q5      0.1036530        0.0986125 0.0872416
+ n0=10000  Quantile       X1_q5      0.0882530        0.0884170 0.0678698
+ n0=20000  Quantile       X1_q5      0.0822156        0.0832307 0.0588404
+ n0=40000  Quantile       X1_q5      0.0781622        0.0782446 0.0535103
+  n0=1000  Quantile      X1_q50      0.0714320        0.0692901 0.0677781
+  n0=2500  Quantile      X1_q50      0.0433101        0.0434169 0.0467121
+  n0=5000  Quantile      X1_q50      0.0277240        0.0272016 0.0349332
+ n0=10000  Quantile      X1_q50      0.0151917        0.0150497 0.0297116
+ n0=20000  Quantile      X1_q50      0.0112590        0.0116998 0.0265565
+ n0=40000  Quantile      X1_q50      0.0100059        0.0095747 0.0243948
+  n0=1000  Quantile      X1_q75      0.0386082        0.0451257 0.1255990
+  n0=2500  Quantile      X1_q75      0.0304525        0.0280094 0.0828174
+  n0=5000  Quantile      X1_q75      0.0162198        0.0169775 0.0616080
+ n0=10000  Quantile      X1_q75      0.0079694        0.0069981 0.0528119
+ n0=20000  Quantile      X1_q75      0.0057791        0.0038153 0.0460547
+ n0=40000  Quantile      X1_q75      0.0030832        0.0012095 0.0466365
+  n0=1000  Quantile      X1_q95     -0.1800267       -0.1800381 0.0720100
+  n0=2500  Quantile      X1_q95     -0.1276927       -0.1276648 0.0462638
+  n0=5000  Quantile      X1_q95     -0.1013913       -0.0999021 0.0352793
+ n0=10000  Quantile      X1_q95     -0.0845074       -0.0840217 0.0292408
+ n0=20000  Quantile      X1_q95     -0.0736213       -0.0731766 0.0255961
+ n0=40000  Quantile      X1_q95     -0.0701252       -0.0693799 0.0238664
+  n0=1000       Cov       X1-X1      0.0931567        0.0842202 0.2856053
+  n0=2500       Cov       X1-X1      0.0900670        0.0911929 0.1344690
+  n0=5000       Cov       X1-X1      0.0656102        0.0674615 0.0669334
+ n0=10000       Cov       X1-X1      0.0393190        0.0370366 0.0366316
+ n0=20000       Cov       X1-X1      0.0234690        0.0234486 0.0172745
+ n0=40000       Cov       X1-X1      0.0120808        0.0121494 0.0081211
+  n0=1000      Mean          X2      0.0623350        0.0621390 0.0134037
+  n0=2500      Mean          X2      0.0351406        0.0350298 0.0066508
+  n0=5000      Mean          X2      0.0203434        0.0203204 0.0036744
+ n0=10000      Mean          X2      0.0108445        0.0109420 0.0018993
+ n0=20000      Mean          X2      0.0057452        0.0057156 0.0010080
+ n0=40000      Mean          X2      0.0029181        0.0029271 0.0004970
+  n0=1000       Var          X2     -0.1077296       -0.1105336 0.1026771
+  n0=2500       Var          X2     -0.0476346       -0.0505747 0.0455770
+  n0=5000       Var          X2     -0.0233144       -0.0236750 0.0233956
+ n0=10000       Var          X2     -0.0114854       -0.0121852 0.0127434
+ n0=20000       Var          X2     -0.0051594       -0.0053729 0.0064426
+ n0=40000       Var          X2     -0.0028151       -0.0028002 0.0033003
+  n0=1000     Lasso          X2     -0.0345674       -0.0347416 0.0114421
+  n0=2500     Lasso          X2     -0.0192484       -0.0193051 0.0054935
+  n0=5000     Lasso          X2     -0.0112831       -0.0112299 0.0027027
+ n0=10000     Lasso          X2     -0.0062218       -0.0061948 0.0015280
+ n0=20000     Lasso          X2     -0.0033601       -0.0033264 0.0007400
+ n0=40000     Lasso          X2     -0.0017017       -0.0017141 0.0003716
+  n0=1000  Quantile      X2_q25      0.2713595        0.2702294 0.1464944
+  n0=2500  Quantile      X2_q25      0.2210469        0.2218666 0.0980945
+  n0=5000  Quantile      X2_q25      0.1904819        0.1915409 0.0737654
+ n0=10000  Quantile      X2_q25      0.1728775        0.1688659 0.0632683
+ n0=20000  Quantile      X2_q25      0.1518444        0.1491811 0.0521073
+ n0=40000  Quantile      X2_q25      0.1417405        0.1431427 0.0516235
+  n0=1000  Quantile       X2_q5      0.0544412        0.0554548 0.1045841
+  n0=2500  Quantile       X2_q5      0.0247996        0.0258753 0.0659342
+  n0=5000  Quantile       X2_q5      0.0028759        0.0023790 0.0517488
+ n0=10000  Quantile       X2_q5     -0.0032207       -0.0014831 0.0422632
+ n0=20000  Quantile       X2_q5     -0.0107593       -0.0098985 0.0371757
+ n0=40000  Quantile       X2_q5     -0.0122398       -0.0116447 0.0337723
+  n0=1000  Quantile      X2_q50      0.0714805        0.0692605 0.0664474
+  n0=2500  Quantile      X2_q50      0.0425597        0.0415392 0.0437987
+  n0=5000  Quantile      X2_q50      0.0302536        0.0303986 0.0317136
+ n0=10000  Quantile      X2_q50      0.0211606        0.0199221 0.0284798
+ n0=20000  Quantile      X2_q50      0.0145279        0.0141514 0.0240282
+ n0=40000  Quantile      X2_q50      0.0106430        0.0104908 0.0244650
+  n0=1000  Quantile      X2_q75      0.0370612        0.0403807 0.1262244
+  n0=2500  Quantile      X2_q75      0.0493637        0.0454874 0.0845739
+  n0=5000  Quantile      X2_q75      0.0622136        0.0606001 0.0704555
+ n0=10000  Quantile      X2_q75      0.0666540        0.0658604 0.0568175
+ n0=20000  Quantile      X2_q75      0.0710669        0.0710893 0.0542386
+ n0=40000  Quantile      X2_q75      0.0698926        0.0715150 0.0491479
+  n0=1000  Quantile      X2_q95     -0.0275771       -0.0277383 0.0737560
+  n0=2500  Quantile      X2_q95     -0.0124575       -0.0163146 0.0523601
+  n0=5000  Quantile      X2_q95     -0.0085350       -0.0092348 0.0365182
+ n0=10000  Quantile      X2_q95     -0.0022685       -0.0008157 0.0292271
+ n0=20000  Quantile      X2_q95     -0.0033913       -0.0023528 0.0267830
+ n0=40000  Quantile      X2_q95     -0.0010084       -0.0005176 0.0243843
+  n0=1000       Cov       X2-X1      0.1813944        0.1840627 0.1042476
+  n0=2500       Cov       X2-X1      0.0858856        0.0858380 0.0468741
+  n0=5000       Cov       X2-X1      0.0472746        0.0459434 0.0251385
+ n0=10000       Cov       X2-X1      0.0245742        0.0244509 0.0133677
+ n0=20000       Cov       X2-X1      0.0120543        0.0121244 0.0067716
+ n0=40000       Cov       X2-X1      0.0064527        0.0063241 0.0032179
+  n0=1000       Cov       X2-X2     -0.1077296       -0.1105336 0.1026771
+  n0=2500       Cov       X2-X2     -0.0476346       -0.0505747 0.0455770
+  n0=5000       Cov       X2-X2     -0.0233144       -0.0236750 0.0233956
+ n0=10000       Cov       X2-X2     -0.0114854       -0.0121852 0.0127434
+ n0=20000       Cov       X2-X2     -0.0051594       -0.0053729 0.0064426
+ n0=40000       Cov       X2-X2     -0.0028151       -0.0028002 0.0033003
+  n0=1000      Mean          X3     -0.0514374       -0.0522108 0.0223181
+  n0=2500      Mean          X3     -0.0274896       -0.0266708 0.0104584
+  n0=5000      Mean          X3     -0.0157202       -0.0158344 0.0053104
+ n0=10000      Mean          X3     -0.0081077       -0.0080242 0.0027598
+ n0=20000      Mean          X3     -0.0043292       -0.0043639 0.0014271
+ n0=40000      Mean          X3     -0.0021585       -0.0021572 0.0006896
+  n0=1000       Var          X3      0.2396176        0.2351913 0.1329170
+  n0=2500       Var          X3      0.1288769        0.1264764 0.0655397
+  n0=5000       Var          X3      0.0803202        0.0787425 0.0339916
+ n0=10000       Var          X3      0.0465685        0.0455744 0.0175476
+ n0=20000       Var          X3      0.0247391        0.0245326 0.0081315
+ n0=40000       Var          X3      0.0132224        0.0132341 0.0040672
+  n0=1000     Lasso          X3     -0.0363757       -0.0364871 0.0118577
+  n0=2500     Lasso          X3     -0.0208067       -0.0208850 0.0052865
+  n0=5000     Lasso          X3     -0.0125151       -0.0125833 0.0027572
+ n0=10000     Lasso          X3     -0.0068624       -0.0068707 0.0014627
+ n0=20000     Lasso          X3     -0.0037579       -0.0037167 0.0007150
+ n0=40000     Lasso          X3     -0.0019034       -0.0019208 0.0003551
+  n0=1000  Quantile      X3_q25      0.0587134        0.0618938 0.1064928
+  n0=2500  Quantile      X3_q25      0.0148018        0.0161051 0.0666953
+  n0=5000  Quantile      X3_q25     -0.0021806       -0.0060164 0.0545908
+ n0=10000  Quantile      X3_q25     -0.0184796       -0.0197706 0.0454025
+ n0=20000  Quantile      X3_q25     -0.0251742       -0.0227034 0.0386632
+ n0=40000  Quantile      X3_q25     -0.0273527       -0.0275463 0.0344201
+  n0=1000  Quantile       X3_q5      0.0244499        0.0216842 0.0913320
+  n0=2500  Quantile       X3_q5     -0.0036938       -0.0030483 0.0577652
+  n0=5000  Quantile       X3_q5     -0.0157811       -0.0135218 0.0441646
+ n0=10000  Quantile       X3_q5     -0.0263779       -0.0279897 0.0368178
+ n0=20000  Quantile       X3_q5     -0.0311311       -0.0305920 0.0317050
+ n0=40000  Quantile       X3_q5     -0.0330989       -0.0339694 0.0297919
+  n0=1000  Quantile      X3_q50      0.0639774        0.0621606 0.0761937
+  n0=2500  Quantile      X3_q50      0.0390573        0.0385940 0.0512917
+  n0=5000  Quantile      X3_q50      0.0251725        0.0235021 0.0400575
+ n0=10000  Quantile      X3_q50      0.0150024        0.0149686 0.0336384
+ n0=20000  Quantile      X3_q50      0.0086313        0.0082355 0.0293098
+ n0=40000  Quantile      X3_q50      0.0067826        0.0063505 0.0275123
+  n0=1000  Quantile      X3_q75     -0.1123728       -0.1125602 0.0785319
+  n0=2500  Quantile      X3_q75     -0.0700241       -0.0707220 0.0525056
+  n0=5000  Quantile      X3_q75     -0.0517198       -0.0522823 0.0401643
+ n0=10000  Quantile      X3_q75     -0.0377966       -0.0400160 0.0339210
+ n0=20000  Quantile      X3_q75     -0.0293297       -0.0294812 0.0289954
+ n0=40000  Quantile      X3_q75     -0.0254897       -0.0244847 0.0269261
+  n0=1000  Quantile      X3_q95      0.1964860        0.1901237 0.1131329
+  n0=2500  Quantile      X3_q95      0.1444726        0.1457738 0.0684715
+  n0=5000  Quantile      X3_q95      0.1308330        0.1316025 0.0534976
+ n0=10000  Quantile      X3_q95      0.1143650        0.1138408 0.0453246
+ n0=20000  Quantile      X3_q95      0.1030683        0.1036054 0.0374902
+ n0=40000  Quantile      X3_q95      0.1020128        0.1016479 0.0379152
+  n0=1000       Cov       X3-X1      0.0168669        0.0210648 0.0974946
+  n0=2500       Cov       X3-X1      0.0048742        0.0066501 0.0431519
+  n0=5000       Cov       X3-X1     -0.0015747       -0.0010229 0.0228230
+ n0=10000       Cov       X3-X1     -0.0004687       -0.0002954 0.0123701
+ n0=20000       Cov       X3-X1     -0.0010073       -0.0008402 0.0060183
+ n0=40000       Cov       X3-X1     -0.0007268       -0.0006704 0.0031641
+  n0=1000       Cov       X3-X2     -0.3115036       -0.3100526 0.0948670
+  n0=2500       Cov       X3-X2     -0.1734847       -0.1734410 0.0422870
+  n0=5000       Cov       X3-X2     -0.1039081       -0.1036024 0.0238413
+ n0=10000       Cov       X3-X2     -0.0583678       -0.0576859 0.0126624
+ n0=20000       Cov       X3-X2     -0.0312570       -0.0313699 0.0058992
+ n0=40000       Cov       X3-X2     -0.0159967       -0.0160881 0.0029573
+  n0=1000       Cov       X3-X3      0.2396176        0.2351913 0.1329170
+  n0=2500       Cov       X3-X3      0.1288769        0.1264764 0.0655397
+  n0=5000       Cov       X3-X3      0.0803202        0.0787425 0.0339916
+ n0=10000       Cov       X3-X3      0.0465685        0.0455744 0.0175476
+ n0=20000       Cov       X3-X3      0.0247391        0.0245326 0.0081315
+ n0=40000       Cov       X3-X3      0.0132224        0.0132341 0.0040672
+> write.csv(summary_tbl, "CLEAR_refsize_bias_summary.csv", row.names = FALSE)
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 4. Per-statistic figures, x = n_0, shared y-axis across panels
+> # -----------------------------------------------------------------------------
+> stat_titles <- c(
++   Mean     = "CLEAR bias vs reference size: Mean",
++   Var      = "CLEAR bias vs reference size: Variance",
++   Cov      = "CLEAR bias vs reference size: Covariance",
++   Quantile = "CLEAR bias vs reference size: Quantiles",
++   Lasso    = "CLEAR bias vs reference size: Lasso coefficients"
++ )
+> 
+> make_stat_plot <- function(st) {
++   d <- long[long$Statistic == st, ]
++   d$Quantity <- factor(d$Quantity, levels = unique(d$Quantity))
++   n_q <- nlevels(d$Quantity)
++ 
++   ggplot(d, aes(x = Setting, y = Bias, fill = Setting)) +
++     geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.3) +
++     geom_boxplot(outlier.size = 0.3, alpha = 0.85, linewidth = 0.3) +
++     facet_wrap(~ Quantity, nrow = 1) +
++     theme_bw(base_size = 10) +
++     theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
++           strip.text  = element_text(size = 8),
++           legend.position = "none") +
++     labs(title = stat_titles[[st]],
++          x = "Reference sample size (n_0)", y = "Bias (estimate - truth)")
++ }
+> 
+> for (st in levels(long$Statistic)) {
++   if (!any(long$Statistic == st)) next
++   p_st <- make_stat_plot(st)
++   n_q  <- length(unique(long$Quantity[long$Statistic == st]))
++   ggsave(sprintf("CLEAR_refsize_bias_%s.png", st), p_st,
++          width = max(6, n_q * 2.2), height = 4.2, dpi = 150, limitsize = FALSE)
++   print(p_st)
++ }
+> 
+> cat("\nSaved: CLEAR_refsize_bias_summary.csv and per-statistic plots ",
++     "(CLEAR_refsize_bias_Mean.png, _Var.png, _Cov.png, _Quantile.png, _Lasso.png)\n", sep = "")
+
+Saved: CLEAR_refsize_bias_summary.csv and per-statistic plots (CLEAR_refsize_bias_Mean.png, _Var.png, _Cov.png, _Quantile.png, _Lasso.png)
+> 
+> proc.time()
+   user  system elapsed 
+ 12.865   0.705 794.047 

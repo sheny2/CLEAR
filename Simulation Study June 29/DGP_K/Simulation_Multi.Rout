@@ -1,0 +1,559 @@
+
+R version 4.3.1 Patched (2023-07-19 r84711) -- "Beagle Scouts"
+Copyright (C) 2023 The R Foundation for Statistical Computing
+Platform: x86_64-conda-linux-gnu (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+[Previously saved workspace restored]
+
+> # =============================================================================
+> # CLEAR parallel simulation study -- performance across DGP complexity
+> # -----------------------------------------------------------------------------
+> # Four DGP settings (only PROPORTIONS changes; all else fixed as in
+> # CLEAR_Single_Sim.R):
+> #     1 Gaussian   : c(1,   0,   0,   0  )
+> #     2-mixture    : c(0.5, 0.5, 0,   0  )
+> #     3-mixture    : c(1/3, 1/3, 1/3, 0  )
+> #     4-mixture    : c(.25, .25, .25, .25)
+> #
+> # 500 iterations per setting, parallel over parallel::detectCores().
+> # Each iteration: generate data -> run CLEAR -> compute global estimates ->
+> # compare to pooled empirical truth for: Mean, Variance, Covariance,
+> # Quantiles, and Lasso coefficients (X1 ~ X2 + X3).
+> #
+> # Per-iteration summary metric per statistic = RELATIVE RMSE:
+> #     sqrt(mean((est - truth)^2)) / (sqrt(mean(truth^2)) + eps)
+> # so all five statistics share a comparable scale.
+> #
+> # Output: ONE figure faceted by statistic (x = DGP setting), plus a CSV.
+> # Requires CLEAR.R (as in CLEAR_Single_Sim.R).
+> # =============================================================================
+> 
+> rm(list = ls())
+> library(parallel)
+> library(MASS)
+> library(mclust)
+Package 'mclust' version 6.0.0
+Type 'citation("mclust")' for citing this R package in publications.
+> library(glmnet)
+Loading required package: Matrix
+Loaded glmnet 4.1-8
+> library(ggplot2)
+> 
+> source("CLEAR.R")
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 0. Fixed configuration 
+> # -----------------------------------------------------------------------------
+> N_ITER  <- 500
+> N_SITES <- 10
+> D       <- 3
+> VAR_NMS <- c("X1", "X2", "X3")
+> K_COMP  <- 3
+> N_0     <- 10000
+> SITE_N  <- round(seq(200, 800, length.out = N_SITES))
+> Q_PROBS <- c(0.05, 0.25, 0.50, 0.75, 0.95)
+> EPS     <- 1e-8
+> 
+> # The four settings -- only PROPORTIONS varies.
+> SETTINGS <- list(
++   "1 Gaussian" = c(1,   0,   0,   0  ),
++   "2-mixture"  = c(0.5, 0.5, 0,   0  ),
++   "3-mixture"  = c(1/3, 1/3, 1/3, 0  ),
++   "4-mixture"  = c(.25, .25, .25, .25)
++ )
+> 
+> # Fixed DGP component bank (same as the single-sim).
+> COMP_CENTERS <- list(c( 0,  0,  0), c( 4,  4, -3),
++                      c(-4,  3,  3), c( 3, -4,  4))
+> comp_cov <- function(s, rho) { M <- matrix(rho, D, D); diag(M) <- 1; (s^2) * M }
+> COMP_COVS <- list(comp_cov(1.0,  0.3), comp_cov(1.4, -0.2),
++                   comp_cov(1.1,  0.1), comp_cov(1.3, -0.3))
+> site_offset <- function(h) c((h - 3) * 1.5, (h - 3) * -1.0, (h - 3) * 0.8)
+> 
+> draw_site <- function(h, n, props) {
++   off  <- site_offset(h)
++   comp <- sample(seq_len(4), n, replace = TRUE, prob = props)
++   X <- matrix(0, n, D)
++   for (k in unique(comp)) {
++     idx <- which(comp == k)
++     X[idx, ] <- mvrnorm(length(idx), mu = COMP_CENTERS[[k]] + off, Sigma = COMP_COVS[[k]])
++   }
++   df <- as.data.frame(X); colnames(df) <- VAR_NMS; df
++ }
+> 
+> rel_rmse <- function(est, truth) {
++   sqrt(mean((est - truth)^2)) / (sqrt(mean(truth^2)) + EPS)
++ }
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 1. One iteration for a given setting 
+> # -----------------------------------------------------------------------------
+> run_one <- function(iter_seed, props) {
++   set.seed(iter_seed)
++   props <- props / sum(props)
++ 
++   site_data <- Map(function(h, n) draw_site(h, n, props), seq_len(N_SITES), SITE_N)
++   pooled    <- do.call(rbind, site_data)
++   n_h       <- sapply(site_data, nrow)
++   w_site    <- n_h / sum(n_h)
++ 
++   truth <- calc_empirical_truth(pooled)
++ 
++   clear <- tryCatch(CLEAR_sim(site_data, K_comp = K_COMP, n_0 = N_0, inflate = 1),
++                     error = function(e) NULL)
++   if (is.null(clear)) return(NULL)
++ 
++   Z_0       <- clear$Z_0
++   site_keys <- paste0("Site_", seq_len(N_SITES))
++   w_global  <- Reduce(`+`, Map(function(k, w) w * clear[[k]]$Weights, site_keys, w_site))
++   w_global  <- w_global / sum(w_global)
++ 
++   # --- Global CLEAR estimates ---
++   est_mean <- Reduce(`+`, Map(function(k, w) w * clear[[k]]$Mean, site_keys, w_site))
++   ex2 <- Reduce(`+`, Map(function(k, w) w * (clear[[k]]$Variance + clear[[k]]$Mean^2),
++                          site_keys, w_site))
++   est_var <- ex2 - est_mean^2
++   ecc <- Reduce(`+`, Map(function(k, w) {
++     mu_h <- clear[[k]]$Mean; w * (clear[[k]]$Covariance + outer(mu_h, mu_h))
++   }, site_keys, w_site))
++   est_cov <- ecc - outer(est_mean, est_mean)
++ 
++   est_quant <- t(sapply(seq_len(D), function(v) {
++     x <- Z_0[, v]; ord <- order(x); xo <- x[ord]; cw <- cumsum(w_global[ord])
++     sapply(Q_PROBS, function(p) xo[which(cw >= p)[1]])
++   }))
++ 
++   # --- Lasso: X1 ~ X2 + X3, pooled vs. weighted reference ---
++   lasso_bias <- tryCatch({
++     Xp <- as.matrix(pooled[, c("X2", "X3")]); yp <- pooled[["X1"]]
++     Xr <- as.matrix(Z_0[, c("X2", "X3")]);    yr <- Z_0[["X1"]]
++     set.seed(1); cp <- as.vector(coef(cv.glmnet(Xp, yp, alpha = 1, nfolds = 5), s = "lambda.min"))
++     set.seed(1); cr <- as.vector(coef(cv.glmnet(Xr, yr, alpha = 1, weights = w_global, nfolds = 5),
++                                        s = "lambda.min"))
++     cr - cp   # signed bias per coefficient; truth = pooled-raw lasso coefs
++   }, error = function(e) rep(NA_real_, 3))
++ 
++   # --- Per-element SIGNED BIAS (estimate - truth) ---
++   # Each statistic is broken out into its individual quantities so the plot can
++   # show one boxplot per variable / per quantile / per coefficient.
++   cov_lt   <- lower.tri(truth$Covariance, diag = TRUE)
++   cov_idx  <- which(cov_lt, arr.ind = TRUE)
++   cov_nms  <- apply(cov_idx, 1, function(ij) paste(VAR_NMS[ij[1]], VAR_NMS[ij[2]], sep = "-"))
++   q_nms    <- as.vector(outer(VAR_NMS, paste0("q", Q_PROBS * 100), paste, sep = "_"))
++ 
++   out <- c(
++     setNames(est_mean - truth$Mean,                          paste0("Mean__",  VAR_NMS)),
++     setNames(est_var  - truth$Variance,                      paste0("Var__",   VAR_NMS)),
++     setNames(est_cov[cov_lt] - truth$Covariance[cov_lt],     paste0("Cov__",   cov_nms)),
++     setNames(as.vector(t(est_quant)) - as.vector(t(truth$Quantiles)),
++              paste0("Quantile__", q_nms)),
++     setNames(lasso_bias,                                     paste0("Lasso__",
++              c("(Intercept)", "X2", "X3")))
++   )
++   out
++ }
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 2. Run all settings in parallel
+> # -----------------------------------------------------------------------------
+> n_cores <- parallelly::availableCores()
+> message(sprintf("Running %d settings x %d iters on %d cores...",
++                 length(SETTINGS), N_ITER, n_cores))
+Running 4 settings x 500 iters on 35 cores...
+> 
+> cl <- makeCluster(n_cores)
+> clusterExport(cl, c("N_SITES", "D", "VAR_NMS", "K_COMP", "N_0", "SITE_N", "Q_PROBS",
++                     "EPS", "COMP_CENTERS", "COMP_COVS", "comp_cov", "site_offset",
++                     "draw_site", "rel_rmse", "run_one",
++                     "CLEAR_sim", "calc_empirical_truth", "site_fit_gmm",
++                     "center_make_reference", "estimate_ipw_weights", "weighted_eda_stats"))
+> clusterEvalQ(cl, { library(MASS); library(mclust); library(glmnet) })
+[[1]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[2]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[3]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[4]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[5]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[6]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[7]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[8]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[9]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[10]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[11]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[12]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[13]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[14]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[15]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[16]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[17]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[18]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[19]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[20]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[21]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[22]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[23]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[24]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[25]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[26]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[27]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[28]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[29]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[30]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[31]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[32]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[33]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[34]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+[[35]]
+ [1] "glmnet"    "Matrix"    "mclust"    "MASS"      "stats"     "graphics" 
+ [7] "grDevices" "utils"     "datasets"  "methods"   "base"     
+
+> 
+> all_rows <- list()
+> for (s in names(SETTINGS)) {
++   message("  setting: ", s)
++   seeds <- seq_len(N_ITER) + 1000L * match(s, names(SETTINGS))
++   res   <- parLapply(cl, seeds, run_one, props = SETTINGS[[s]])
++   res   <- res[!sapply(res, is.null)]
++   # Align by name (all returns share the same names) then bind.
++   nm    <- names(res[[1]])
++   M     <- do.call(rbind, lapply(res, function(r) r[nm]))
++   colnames(M) <- nm
++   df    <- as.data.frame(M, check.names = FALSE)
++   df$Setting <- s
++   all_rows[[s]] <- df
++   message(sprintf("    %d / %d iterations succeeded.", nrow(df), N_ITER))
++ }
+  setting: 1 Gaussian
+    500 / 500 iterations succeeded.
+  setting: 2-mixture
+    500 / 500 iterations succeeded.
+  setting: 3-mixture
+    500 / 500 iterations succeeded.
+  setting: 4-mixture
+    500 / 500 iterations succeeded.
+> stopCluster(cl)
+> 
+> results <- do.call(rbind, all_rows)
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 3. Reshape to long (one row per iteration x quantity) + summary CSV
+> # -----------------------------------------------------------------------------
+> # Column names look like "Mean__X1", "Quantile__X2_q25", "Lasso__X3" etc.
+> quantity_cols <- setdiff(colnames(results), "Setting")
+> 
+> long <- do.call(rbind, lapply(quantity_cols, function(q) {
++   parts <- strsplit(q, "__", fixed = TRUE)[[1]]
++   data.frame(Setting   = results$Setting,
++              Statistic = parts[1],
++              Quantity  = parts[2],
++              Bias      = results[[q]],
++              stringsAsFactors = FALSE)
++ }))
+> 
+> stat_levels <- c("Mean", "Var", "Cov", "Quantile", "Lasso")
+> long$Setting   <- factor(long$Setting, levels = names(SETTINGS))
+> long$Statistic <- factor(long$Statistic, levels = stat_levels)
+> # Panel label combines statistic + quantity, e.g. "Mean: X1", "Quantile: X2_q25".
+> long$Panel <- factor(paste0(long$Statistic, ": ", long$Quantity),
++                       levels = unique(paste0(long$Statistic, ": ", long$Quantity)))
+> long <- long[is.finite(long$Bias), ]
+> 
+> summary_tbl <- aggregate(Bias ~ Setting + Statistic + Quantity, data = long,
++                          FUN = function(x) c(bias_mean = mean(x), bias_median = median(x),
++                                              sd = sd(x)))
+> summary_tbl <- do.call(data.frame, summary_tbl)
+> print(summary_tbl, digits = 4, row.names = FALSE)
+    Setting Statistic    Quantity Bias.bias_mean Bias.bias_median  Bias.sd
+ 1 Gaussian     Lasso (Intercept)      1.173e-04        2.659e-04 0.003219
+  2-mixture     Lasso (Intercept)      5.566e-02        5.554e-02 0.003945
+  3-mixture     Lasso (Intercept)      3.320e-02        3.317e-02 0.005570
+  4-mixture     Lasso (Intercept)     -3.682e-02       -3.792e-02 0.012256
+ 1 Gaussian      Mean          X1      9.140e-04        9.168e-04 0.001390
+  2-mixture      Mean          X1      3.631e-02        3.619e-02 0.002379
+  3-mixture      Mean          X1      1.317e-02        1.322e-02 0.003480
+  4-mixture      Mean          X1      5.615e-03        5.428e-03 0.003856
+ 1 Gaussian       Var          X1      1.440e-02        1.447e-02 0.009974
+  2-mixture       Var          X1     -2.368e-03       -2.717e-03 0.021155
+  3-mixture       Var          X1      4.219e-02        4.284e-02 0.033913
+  4-mixture       Var          X1     -1.203e-01       -1.218e-01 0.057880
+ 1 Gaussian  Quantile      X1_q25      8.056e-04        1.003e-03 0.023863
+  2-mixture  Quantile      X1_q25      7.236e-02        7.128e-02 0.035007
+  3-mixture  Quantile      X1_q25     -3.106e-02       -3.138e-02 0.041656
+  4-mixture  Quantile      X1_q25     -3.936e-02       -3.242e-02 0.091301
+ 1 Gaussian  Quantile       X1_q5     -8.757e-03       -1.024e-02 0.040478
+  2-mixture  Quantile       X1_q5      2.190e-02        2.489e-02 0.060819
+  3-mixture  Quantile       X1_q5      9.309e-02        8.821e-02 0.070624
+  4-mixture  Quantile       X1_q5      1.625e-01        1.614e-01 0.138232
+ 1 Gaussian  Quantile      X1_q50     -2.444e-03       -2.952e-03 0.019521
+  2-mixture  Quantile      X1_q50      8.266e-02        8.293e-02 0.030982
+  3-mixture  Quantile      X1_q50      1.711e-02        1.841e-02 0.029237
+  4-mixture  Quantile      X1_q50     -1.975e-02       -1.800e-02 0.059434
+ 1 Gaussian  Quantile      X1_q75      6.175e-03        8.574e-03 0.033398
+  2-mixture  Quantile      X1_q75     -2.704e-02       -2.635e-02 0.057358
+  3-mixture  Quantile      X1_q75      8.811e-03        9.332e-03 0.051202
+  4-mixture  Quantile      X1_q75      3.266e-01        3.255e-01 0.077940
+ 1 Gaussian  Quantile      X1_q95      3.534e-04        8.170e-04 0.018912
+  2-mixture  Quantile      X1_q95     -2.722e-02       -2.617e-02 0.025623
+  3-mixture  Quantile      X1_q95     -8.576e-02       -8.492e-02 0.029359
+  4-mixture  Quantile      X1_q95      5.138e-02        4.737e-02 0.055634
+ 1 Gaussian       Cov       X1-X1      1.440e-02        1.447e-02 0.009974
+  2-mixture       Cov       X1-X1     -2.368e-03       -2.717e-03 0.021155
+  3-mixture       Cov       X1-X1      4.219e-02        4.284e-02 0.033913
+  4-mixture       Cov       X1-X1     -1.203e-01       -1.218e-01 0.057880
+ 1 Gaussian      Mean          X2     -6.276e-04       -6.533e-04 0.001370
+  2-mixture      Mean          X2      3.401e-02        3.399e-02 0.002476
+  3-mixture      Mean          X2      1.116e-02        1.118e-02 0.001927
+  4-mixture      Mean          X2     -3.904e-02       -3.863e-02 0.007928
+ 1 Gaussian       Var          X2      7.129e-03        7.579e-03 0.006992
+  2-mixture       Var          X2      8.031e-02        7.984e-02 0.017384
+  3-mixture       Var          X2     -1.160e-02       -1.132e-02 0.012368
+  4-mixture       Var          X2      1.132e-01        1.080e-01 0.064799
+ 1 Gaussian     Lasso          X2      8.334e-05        9.698e-05 0.001227
+  2-mixture     Lasso          X2     -5.192e-03       -5.100e-03 0.002949
+  3-mixture     Lasso          X2     -6.338e-03       -6.401e-03 0.001352
+  4-mixture     Lasso          X2      1.237e-02        1.185e-02 0.004944
+ 1 Gaussian  Quantile      X2_q25      1.520e-02        1.648e-02 0.028919
+  2-mixture  Quantile      X2_q25     -2.797e-03       -1.263e-03 0.053598
+  3-mixture  Quantile      X2_q25      1.703e-01        1.706e-01 0.061334
+  4-mixture  Quantile      X2_q25      6.083e-02        3.110e-02 0.117511
+ 1 Gaussian  Quantile       X2_q5     -1.503e-03       -4.398e-04 0.031479
+  2-mixture  Quantile       X2_q5      4.181e-02        4.023e-02 0.038810
+  3-mixture  Quantile       X2_q5     -6.531e-03       -6.118e-03 0.042303
+  4-mixture  Quantile       X2_q5     -3.297e-02       -3.228e-02 0.080328
+ 1 Gaussian  Quantile      X2_q50     -6.953e-04        1.680e-04 0.020262
+  2-mixture  Quantile      X2_q50      8.856e-02        9.025e-02 0.029526
+  3-mixture  Quantile      X2_q50      2.071e-02        1.946e-02 0.027301
+  4-mixture  Quantile      X2_q50     -2.700e-01       -2.696e-01 0.050765
+ 1 Gaussian  Quantile      X2_q75     -5.208e-03       -3.911e-03 0.031200
+  2-mixture  Quantile      X2_q75     -3.713e-02       -3.696e-02 0.052324
+  3-mixture  Quantile      X2_q75      6.615e-02        6.474e-02 0.059047
+  4-mixture  Quantile      X2_q75     -1.861e-01       -1.830e-01 0.081152
+ 1 Gaussian  Quantile      X2_q95      1.253e-03        4.297e-04 0.019291
+  2-mixture  Quantile      X2_q95     -2.512e-02       -2.482e-02 0.026644
+  3-mixture  Quantile      X2_q95     -4.872e-03       -4.509e-03 0.030234
+  4-mixture  Quantile      X2_q95      3.416e-02        3.424e-02 0.045746
+ 1 Gaussian       Cov       X2-X1     -9.761e-03       -9.738e-03 0.005487
+  2-mixture       Cov       X2-X1     -4.633e-02       -4.622e-02 0.010441
+  3-mixture       Cov       X2-X1      2.415e-02        2.296e-02 0.012695
+  4-mixture       Cov       X2-X1      1.330e-02        1.027e-02 0.056693
+ 1 Gaussian       Cov       X2-X2      7.129e-03        7.579e-03 0.006992
+  2-mixture       Cov       X2-X2      8.031e-02        7.984e-02 0.017384
+  3-mixture       Cov       X2-X2     -1.160e-02       -1.132e-02 0.012368
+  4-mixture       Cov       X2-X2      1.132e-01        1.080e-01 0.064799
+ 1 Gaussian      Mean          X3      4.524e-04        4.090e-04 0.001360
+  2-mixture      Mean          X3     -2.600e-02       -2.584e-02 0.002059
+  3-mixture      Mean          X3     -8.470e-03       -8.523e-03 0.002771
+  4-mixture      Mean          X3      2.235e-02        2.219e-02 0.005737
+ 1 Gaussian       Var          X3      5.010e-03        5.357e-03 0.006015
+  2-mixture       Var          X3      3.235e-02        3.241e-02 0.011637
+  3-mixture       Var          X3      4.595e-02        4.566e-02 0.017276
+  4-mixture       Var          X3      6.765e-02        6.091e-02 0.050507
+ 1 Gaussian     Lasso          X3      9.220e-05        1.695e-04 0.001546
+  2-mixture     Lasso          X3     -6.469e-03       -6.441e-03 0.003715
+  3-mixture     Lasso          X3     -7.018e-03       -6.979e-03 0.001445
+  4-mixture     Lasso          X3      1.251e-02        1.229e-02 0.003835
+ 1 Gaussian  Quantile      X3_q25     -5.999e-03       -7.025e-03 0.028524
+  2-mixture  Quantile      X3_q25     -1.355e-01       -1.351e-01 0.035694
+  3-mixture  Quantile      X3_q25     -1.492e-02       -1.566e-02 0.045818
+  4-mixture  Quantile      X3_q25      3.096e-01        3.062e-01 0.073453
+ 1 Gaussian  Quantile       X3_q5     -8.034e-04       -1.541e-03 0.027086
+  2-mixture  Quantile       X3_q5      3.896e-02        4.047e-02 0.031774
+  3-mixture  Quantile       X3_q5     -2.435e-02       -2.316e-02 0.036382
+  4-mixture  Quantile       X3_q5     -2.986e-02       -3.166e-02 0.077107
+ 1 Gaussian  Quantile      X3_q50     -1.353e-03       -2.852e-03 0.024208
+  2-mixture  Quantile      X3_q50      6.244e-02        6.393e-02 0.032489
+  3-mixture  Quantile      X3_q50      1.493e-02        1.515e-02 0.034370
+  4-mixture  Quantile      X3_q50     -1.620e-01       -1.609e-01 0.061084
+ 1 Gaussian  Quantile      X3_q75      7.187e-04       -7.716e-04 0.021093
+  2-mixture  Quantile      X3_q75     -3.106e-02       -3.129e-02 0.028972
+  3-mixture  Quantile      X3_q75     -3.825e-02       -3.706e-02 0.033043
+  4-mixture  Quantile      X3_q75      1.267e-01        1.276e-01 0.055033
+ 1 Gaussian  Quantile      X3_q95      4.744e-03        4.473e-03 0.026881
+  2-mixture  Quantile      X3_q95      4.632e-04       -1.282e-03 0.033577
+  3-mixture  Quantile      X3_q95      1.160e-01        1.176e-01 0.043593
+  4-mixture  Quantile      X3_q95     -6.643e-02       -6.598e-02 0.050471
+ 1 Gaussian       Cov       X3-X1      8.476e-03        8.574e-03 0.006562
+  2-mixture       Cov       X3-X1      1.515e-02        1.544e-02 0.008559
+  3-mixture       Cov       X3-X1     -1.602e-03       -1.538e-03 0.011961
+  4-mixture       Cov       X3-X1      8.710e-02        8.872e-02 0.043579
+ 1 Gaussian       Cov       X3-X2     -5.585e-03       -5.892e-03 0.004195
+  2-mixture       Cov       X3-X2     -4.200e-02       -4.194e-02 0.012097
+  3-mixture       Cov       X3-X2     -5.812e-02       -5.792e-02 0.012491
+  4-mixture       Cov       X3-X2     -8.896e-02       -8.790e-02 0.053785
+ 1 Gaussian       Cov       X3-X3      5.010e-03        5.357e-03 0.006015
+  2-mixture       Cov       X3-X3      3.235e-02        3.241e-02 0.011637
+  3-mixture       Cov       X3-X3      4.595e-02        4.566e-02 0.017276
+  4-mixture       Cov       X3-X3      6.765e-02        6.091e-02 0.050507
+> write.csv(summary_tbl, "CLEAR_study_bias_summary.csv", row.names = FALSE)
+> 
+> 
+> 
+> 
+> # -----------------------------------------------------------------------------
+> # 4. SEPARATE figures per statistic, each with a SHARED y-axis across panels
+> # -----------------------------------------------------------------------------
+> # One plot per statistic (Mean, Var, Cov, Quantile, Lasso). Within a plot,
+> # panels = quantities, faceted with fixed (shared) y scale so biases are
+> # directly comparable across quantities of the same statistic.
+> 
+> stat_titles <- c(
++   Mean     = "CLEAR bias: Mean",
++   Var      = "CLEAR bias: Variance",
++   Cov      = "CLEAR bias: Covariance",
++   Quantile = "CLEAR bias: Quantiles",
++   Lasso    = "CLEAR bias: Lasso coefficients"
++ )
+> 
+> make_stat_plot <- function(st) {
++   d <- long[long$Statistic == st, ]
++   d$Quantity <- factor(d$Quantity, levels = unique(d$Quantity))
++   n_q <- nlevels(d$Quantity)
++ 
++   ggplot(d, aes(x = Setting, y = Bias, fill = Setting)) +
++     geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.3) +
++     geom_boxplot(outlier.size = 0.3, alpha = 0.85, linewidth = 0.3) +
++     facet_wrap(~ Quantity, nrow = 1) +          # shared y-axis (no free scales)
++     theme_bw(base_size = 10) +
++     theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
++           strip.text  = element_text(size = 8),
++           legend.position = "none") +
++     labs(title = stat_titles[[st]],
++          x = "DGP setting", y = "Bias (estimate - truth)")
++ }
+> 
+> for (st in levels(long$Statistic)) {
++   if (!any(long$Statistic == st)) next
++   p_st <- make_stat_plot(st)
++   n_q  <- length(unique(long$Quantity[long$Statistic == st]))
++   ggsave(sprintf("CLEAR_study_bias_%s.png", st), p_st,
++          width = max(6, n_q * 2.2), height = 4.2, dpi = 150, limitsize = FALSE)
++   print(p_st)
++ }
+> 
+> cat("\nSaved: CLEAR_study_bias_summary.csv and per-statistic plots ",
++     "(CLEAR_study_bias_Mean.png, _Var.png, _Cov.png, _Quantile.png, _Lasso.png)\n", sep = "")
+
+Saved: CLEAR_study_bias_summary.csv and per-statistic plots (CLEAR_study_bias_Mean.png, _Var.png, _Cov.png, _Quantile.png, _Lasso.png)
+> 
+> proc.time()
+   user  system elapsed 
+  4.222   0.251 179.241 
