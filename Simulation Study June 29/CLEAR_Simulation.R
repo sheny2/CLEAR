@@ -13,7 +13,7 @@
 # Requires CLEAR_v2.R (site_fit_gmm, center_make_reference,
 # estimate_ipw_weights, weighted_eda_stats, CLEAR_sim, calc_empirical_truth).
 # =============================================================================
-
+rm(list = ls())
 library(parallel)
 library(MASS)
 library(mclust)
@@ -23,11 +23,10 @@ library(reshape2)
 # Adjust path as needed.
 source("CLEAR.R")
 
-
 # -----------------------------------------------------------------------------
 # 0. Global configuration
 # -----------------------------------------------------------------------------
-N_ITER   <- 500
+N_ITER   <- 100
 N_SITES  <- 5
 D        <- 3
 VAR_NMS  <- c("X1", "X2", "X3")
@@ -234,7 +233,7 @@ summary_table <- rbind(
 
 cat("\n=========== CLEAR vs. Empirical Truth: Bias / RMSE ===========\n")
 print(summary_table, digits = 4, row.names = FALSE)
-write.csv(summary_table, "CLEAR_sim_summary.csv", row.names = FALSE)
+# write.csv(summary_table, "CLEAR_sim_summary.csv", row.names = FALSE)
 
 
 # -----------------------------------------------------------------------------
@@ -264,6 +263,6 @@ p <- ggplot(long_all, aes(x = Quantity, y = Error)) +
        subtitle = "Non-Gaussian mixture DGP, 5 sites x 3 dims",
        y = "Estimate - Truth", x = NULL)
 
-ggsave("CLEAR_sim_boxplots.png", p, width = 11, height = 8, dpi = 150)
-cat("\nSaved: CLEAR_sim_summary.csv, CLEAR_sim_boxplots.png\n")
+# ggsave("CLEAR_sim_boxplots.png", p, width = 11, height = 8, dpi = 150)
+# cat("\nSaved: CLEAR_sim_summary.csv, CLEAR_sim_boxplots.png\n")
 print(p)
